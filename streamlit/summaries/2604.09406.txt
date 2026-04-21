@@ -1,0 +1,16 @@
+Title: OASIS: Online Activation Subspace Learning for Memory-Efficient Training
+
+**TL;DR:** This paper proposes OASIS, an online activation subspace learning algorithm that reduces the memory footprint of training large language models by compressing activations, gradients, and optimizer states. OASIS achieves significant memory savings while maintaining competitive performance, making it a valuable technique for efficient machine learning.
+
+**Problem:** Training large language models is constrained by memory requirements, with activations accounting for a substantial fraction of the total footprint. Existing approaches either reduce memory using low-rank weight parameterizations or low-rank gradient subspaces, but these methods do not address activation memory or require invasive architectural modifications.
+
+**Method:** OASIS uses an online activation subspace learning mechanism based on Oja's rule to track and continuously update a low-dimensional activation subspace during training. Intermediate activations are projected onto this evolving subspace, reducing memory without modifying forward-pass computations. The algorithm also updates optimizer states consistently using a projection-aware optimizer.
+
+**Results:** OASIS achieves up to 2x2 lower peak memory than full fine-tuning while matching its performance and outperforming prior low-rank methods. It reduces peak memory by up to 30% relative to LDAdam at comparable accuracy and outperforms prior low-rank methods in aggressive compression regimes.
+
+**Why it matters:** OASIS is a significant contribution to the field of machine learning, as it enables the efficient training of large language models while reducing memory requirements. This technique has the potential to accelerate the development of more powerful and efficient language models, which can be applied to various applications such as natural language processing, text generation, and language translation.
+
+**3 things to remember:**
+- OASIS uses an online activation subspace learning mechanism to compress activations, gradients, and optimizer states, reducing memory requirements during training.
+- The algorithm updates the activation subspace using Oja's rule, which incrementally steers the basis toward directions of high variance while removing components already captured by the current subspace.
+- OASIS achieves significant memory savings while maintaining competitive performance, making it a valuable technique for efficient machine learning and a potential accelerator for the development of more powerful language models.

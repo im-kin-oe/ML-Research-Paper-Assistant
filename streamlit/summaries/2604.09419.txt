@@ -1,0 +1,16 @@
+Title: NOMAD: Generating Embeddings for Massive Distributed Graphs
+
+**TL;DR:** This paper introduces Nomad, a distributed-memory graph embedding framework that scales up graph embedding generation for massive graphs with millions to billions of edges. Nomad achieves significant speedups over existing methods while maintaining competitive embedding quality.
+
+**Problem:** Graph embedding generation is a crucial task in machine learning, but existing methods face scalability challenges when dealing with massive graphs due to memory and processing limitations.
+
+**Method:** Nomad uses a distributed-memory approach, implementing the Message Passing Interface (MPI) to handle large-scale graphs. It employs a proximity-based model, similar to the LINE algorithm, and introduces several communication-avoiding and synchronization trade-offs to improve scalability and efficiency.
+
+**Results:** Nomad demonstrates median speedups of 10-100x on CPU-based clusters and 35-76x over distributed-memory baselines, while maintaining competitive embedding quality. It also achieves end-to-end speedups of up to 370x on real-world graphs.
+
+**Why it matters:** This research is important for machine learning students because it addresses a significant scalability challenge in graph embedding generation, enabling the application of graph-based machine learning models to large-scale real-world problems. By developing a distributed-memory approach, Nomad paves the way for more efficient and scalable graph embedding generation, which can be applied to various domains, including web and science applications.
+
+**3 things to remember:**
+- Nomad uses a distributed-memory approach to scale up graph embedding generation, making it possible to handle massive graphs with millions to billions of edges.
+- The framework implements a proximity-based model, similar to the LINE algorithm, and introduces communication-avoiding and synchronization trade-offs to improve efficiency.
+- Nomad achieves significant speedups over existing methods while maintaining competitive embedding quality, making it a promising solution for large-scale graph-based machine learning applications.

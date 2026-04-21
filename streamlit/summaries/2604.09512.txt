@@ -1,0 +1,16 @@
+Title: Integrated Electro-Optic Attention Nonlinearities for Transformers
+
+**TL;DR:** This paper proposes using thin-film lithium niobate (TFLN) Mach-Zehnder modulators (MZMs) as analog nonlinear computational elements to reduce the latency of nonlinear computations in Transformers, specifically the Softmax and Sigmoid functions. The authors demonstrate that their approach can maintain competitive accuracy while reducing the latency of these computations.
+
+**Problem:** The Softmax function, a crucial component of the Transformer architecture, can become a bottleneck in terms of latency due to its nonlinear nature, despite accounting for only a small fraction of the total operations. This bottleneck can significantly impact the overall performance of large language models and computer vision models.
+
+**Method:** The authors propose using TFLN MZMs as analog nonlinear computational elements to approximate the Softmax and Sigmoid functions. They fabricate MZMs on the TFLN platform and use them to compute the nonlinear activations, leveraging the high-speed nonlinear transfer function of the MZMs. They also evaluate their approach in Vision Transformers and Large Language Models, using 4-bit input-output quantization of the analog units.
+
+**Results:** The authors demonstrate that their approach can maintain highly competitive accuracy, even under aggressive 4-bit input-output quantization of the analog units. They also characterize system noise at encoding speeds up to 10 GBaud and assess model robustness under various noise conditions.
+
+**Why it matters:** This research is important for anyone learning ML because it highlights the need to optimize nonlinear computations in deep learning models, particularly in the context of Transformers. The proposed approach using TFLN MZMs offers a promising solution to reduce the latency of these computations, which can significantly impact the overall performance of large language models and computer vision models.
+
+**3 things to remember:**
+- The Softmax function can become a bottleneck in terms of latency in Transformers, despite accounting for only a small fraction of the total operations.
+- TFLN MZMs can be used as analog nonlinear computational elements to approximate the Softmax and Sigmoid functions, reducing the latency of these computations.
+- The proposed approach can maintain highly competitive accuracy, even under aggressive quantization of the analog units, making it a promising solution for optimizing nonlinear computations in deep learning models.

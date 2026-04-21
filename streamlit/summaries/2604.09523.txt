@@ -1,0 +1,16 @@
+Title: Event-Driven Temporal Graph Networks for Asynchronous Multi-Agent Cyber Defense in NetForge_RL
+
+**TL;DR:** This paper introduces NetForge_RL, a high-fidelity cyber operations simulator that bridges the Sim2Real gap in Multi-Agent Reinforcement Learning (MARL) for autonomous cyber defense. The proposed Continuous-Time Graph MARL (CT-GMARL) architecture achieves significant improvements in reward and service restoration over existing baselines.
+
+**Problem:** The Sim2Real gap in MARL for autonomous cyber defense, where policies trained in simulated environments fail to perform well in real-world settings due to limitations in existing simulators, such as synchronous turns, clean state vectors, and static topologies.
+
+**Method:** The authors propose NetForge_RL, a continuous-time POSMDP simulator that models cyber operations as an asynchronous, continuous-time process with authentic NLP-encoded telemetry and stochastic false-positive noise. They also introduce CT-GMARL, a novel ODE-RNN graph architecture designed for asynchronous multi-agent defense over dynamic network topologies.
+
+**Results:** CT-GMARL achieves a 2.0x improvement in reward over R-MAPPO and restores 12x more compromised services. In Zero-Shot transfer to a live DockerHypervisor, CT-GMARL yields a median reward of 98,026, demonstrating robust policy retention across the Sim2Real boundary.
+
+**Why it matters:** This research addresses a critical challenge in deploying MARL policies in real-world cyber defense scenarios, where the Sim2Real gap can lead to significant performance degradation. The proposed NetForge_RL and CT-GMARL ecosystem have the potential to improve the effectiveness of autonomous cyber defense systems.
+
+**3 things to remember:**
+- NetForge_RL is a high-fidelity cyber operations simulator that models cyber operations as an asynchronous, continuous-time process with authentic NLP-encoded telemetry and stochastic false-positive noise.
+- CT-GMARL is a novel ODE-RNN graph architecture designed for asynchronous multi-agent defense over dynamic network topologies, which achieves significant improvements in reward and service restoration over existing baselines.
+- The proposed ecosystem addresses the Sim2Real gap in MARL for autonomous cyber defense, enabling more effective deployment of MARL policies in real-world scenarios.

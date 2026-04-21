@@ -1,0 +1,16 @@
+Title: 𝙰𝙽𝚃𝙸𝙲 : Adaptive Neural Temporal In-situ Compressor
+
+**TL;DR:** This paper introduces 𝙰𝙽𝚃𝙸𝙲, a novel in-situ compression framework that reduces storage requirements for large-scale scientific simulations by adaptively selecting informative snapshots and compressing them using neural fields. This approach achieves significant storage reductions while maintaining high-fidelity physics reconstruction.
+
+**Problem:** The increasing spatiotemporal resolutions of large-scale scientific simulations have led to explosive data growth, posing a severe bottleneck for storage and scalability. Existing compression methods often struggle to capture complex correlations and can become memory costly, making it challenging to manage large-scale time-varying volumetric datasets.
+
+**Method:** 𝙰𝙽𝚃𝙸𝙲 combines an adaptive temporal selector with a spatial neural compression module based on continual fine-tuning of neural fields. The temporal selector identifies informative snapshots based on physics-of-interest, while the spatial compression module learns residuals between adjacent snapshots using neural fields. This approach enables non-uniform temporal selection and flexible compression ratios.
+
+**Results:** Experimental results demonstrate significant storage reductions, with up to 435x compression achieved for 2D Kolmogorov turbulence and up to 6807x compression for a 3D Binary Black Hole merger simulation. The framework also maintains high-fidelity physics reconstruction, with spatial compression ratios up to 3744x per snapshot.
+
+**Why it matters:** This research is crucial for advancing large-scale scientific simulations, as it addresses the pressing issue of data storage and scalability. By reducing storage requirements, 𝙰𝙽𝚃𝙸𝙲 enables researchers to run more complex and detailed simulations, leading to breakthroughs in various fields, including physics, climate modeling, and engineering.
+
+**3 things to remember:**
+- 𝙰𝙽𝚃𝙸𝙲 is an in-situ compression framework that combines adaptive temporal selection with spatial neural compression, achieving significant storage reductions while maintaining high-fidelity physics reconstruction.
+- The framework uses physics-aware metrics to identify informative snapshots, allowing for non-uniform temporal selection and flexible compression ratios.
+- 𝙰𝙽𝚃𝙸𝙲 has the potential to revolutionize large-scale scientific simulations by addressing the pressing issue of data storage and scalability, enabling researchers to run more complex and detailed simulations.
