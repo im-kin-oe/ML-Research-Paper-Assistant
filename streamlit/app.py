@@ -3,8 +3,8 @@ import os
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# ✅ FIX: use summaries folder inside streamlit
-SUMMARIES_DIR = os.path.join(BASE_DIR, "streamlit", "summaries")
+
+SUMMARIES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "summaries")
 
 st.set_page_config(page_title="ML Paper Assistant", layout="wide")
 st.title("ML Paper Assistant")
