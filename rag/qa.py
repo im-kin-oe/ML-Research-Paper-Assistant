@@ -6,11 +6,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLEANED_JSON_DIR = os.path.join(BASE_DIR, "cleaned_json")
+CLEANED_JSON_DIR = os.path.join(BASE_DIR, "streamlit", "summaries")
 SUMMARIES_DIR = os.path.join(BASE_DIR, "summaries")
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 MODEL = "llama-3.3-70b-versatile"
+
 
 def summarize_paper(paper):
     # build context from abstract + first 3 sections
@@ -57,18 +58,27 @@ Paper content:
 
     return response.choices[0].message.content
 
+
 if __name__ == "__main__":
     os.makedirs(SUMMARIES_DIR, exist_ok=True)
 
-    files = [f for f in os.listdir(CLEANED_JSON_DIR) if f.endswith(".json")]
+    files = [f for f in os.listdir(CLEANED_JSON_DIR) if f.endswith(".txt")]
     print(f"Found {len(files)} papers to summarize")
 
     for filename in files:
-        paper_id = filename.replace(".json", "")
+        paper_id = filename.replace(".txt", "")
         print(f"\nSummarizing: {paper_id}")
 
+        # ✅ FIX: read TXT instead of JSON
         with open(os.path.join(CLEANED_JSON_DIR, filename), encoding="utf-8") as f:
-            paper = json.load(f)
+            content = f.read()
+
+        # ✅ FIX: create fake paper structure
+        paper = {
+            "title": paper_id,
+            "abstract": content,
+            "sections": []
+        }
 
         summary = summarize_paper(paper)
 
