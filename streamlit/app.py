@@ -2,8 +2,6 @@ import streamlit as st
 import os
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
 SUMMARIES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "summaries")
 
 st.set_page_config(page_title="ML Paper Assistant", layout="wide")
