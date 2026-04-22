@@ -6,51 +6,60 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLEANED_JSON_DIR = os.path.join(BASE_DIR, "streamlit", "summaries")
-SUMMARIES_DIR = os.path.join(BASE_DIR, "summaries")
+
+# ✅ FIX: use REAL structured data
+CLEANED_JSON_DIR = os.path.join(BASE_DIR, "cleaned_json")
+
+# ✅ output stays same
+SUMMARIES_DIR = os.path.join(BASE_DIR, "streamlit", "summaries")
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 MODEL = "llama-3.3-70b-versatile"
 
 
 def summarize_paper(paper):
-    # build context from abstract + first 3 sections
-    context = paper.get("abstract", "") + "\n\n"
-    
-    for section in paper.get("sections", [])[:3]:
+    # 🔥 better context (more useful info)
+    context = f"Title: {paper.get('title','')}\n\n"
+    context += f"Abstract:\n{paper.get('abstract','')}\n\n"
+
+    # include more sections (not just 3 blindly)
+    for section in paper.get("sections", [])[:5]:
         heading = section.get("heading", "")
-        body = section.get("body", "")
+        body = section.get("body", "")[:1000]  # avoid token overflow
         context += f"{heading}\n{body}\n\n"
 
     response = client.chat.completions.create(
         model=MODEL,
-        temperature=0.3,
-        max_tokens=1024,
+        temperature=0.2,  # more precise
+        max_tokens=1200,
         messages=[
             {
                 "role": "system",
-                "content": "You are an expert ML researcher who explains research papers clearly to students learning machine learning."
+                "content": """You are an expert ML researcher.
+Explain papers clearly, accurately, and concisely.
+Do NOT hallucinate missing details.
+If results are missing, say "Not clearly stated"."""
             },
             {
                 "role": "user",
-                "content": f"""Read this ML research paper and summarize it in exactly this format:
+                "content": f"""Summarize this ML research paper in this format:
 
-**TL;DR:** (1-2 sentences, what this paper does in simple words)
+**TL;DR:** (1-2 simple sentences)
 
-**Problem:** (what problem does this paper solve?)
+**Problem:** (what problem is solved)
 
-**Method:** (how did they solve it? what technique or model did they use?)
+**Method:** (key idea, model, approach)
 
-**Results:** (key numbers, accuracy, improvements they achieved)
+**Results:** (numbers, benchmarks, improvements — if not present say "Not clearly stated")
 
-**Why it matters:** (why should someone learning ML care about this?)
+**Why it matters:** (practical importance)
 
-**3 things to remember:**
+**3 key takeaways:**
 - 
 - 
 -
 
-Paper content:
+Paper:
 {context}"""
             }
         ]
@@ -62,30 +71,24 @@ Paper content:
 if __name__ == "__main__":
     os.makedirs(SUMMARIES_DIR, exist_ok=True)
 
-    files = [f for f in os.listdir(CLEANED_JSON_DIR) if f.endswith(".txt")]
+    # ✅ FIX: use JSON files
+    files = [f for f in os.listdir(CLEANED_JSON_DIR) if f.endswith(".json")]
     print(f"Found {len(files)} papers to summarize")
 
     for filename in files:
-        paper_id = filename.replace(".txt", "")
+        paper_id = filename.replace(".json", "")
         print(f"\nSummarizing: {paper_id}")
 
-        # ✅ FIX: read TXT instead of JSON
+        # ✅ FIX: load REAL structured paper
         with open(os.path.join(CLEANED_JSON_DIR, filename), encoding="utf-8") as f:
-            content = f.read()
-
-        # ✅ FIX: create fake paper structure
-        paper = {
-            "title": paper_id,
-            "abstract": content,
-            "sections": []
-        }
+            paper = json.load(f)
 
         summary = summarize_paper(paper)
 
-        # save summary
+        # save summary to streamlit folder
         output_path = os.path.join(SUMMARIES_DIR, f"{paper_id}.txt")
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write(f"Title: {paper['title']}\n\n")
+            f.write(f"Title: {paper.get('title','')}\n\n")
             f.write(summary)
 
         print(summary[:300])

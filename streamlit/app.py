@@ -1,8 +1,9 @@
 import streamlit as st
 import os
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SUMMARIES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "summaries")
+# ✅ Always resolve path relative to THIS file
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SUMMARIES_DIR = os.path.join(CURRENT_DIR, "summaries")
 
 st.set_page_config(page_title="ML Paper Assistant", layout="wide")
 st.title("ML Paper Assistant")
@@ -24,28 +25,37 @@ with st.sidebar:
     st.markdown("3. Click Arxiv link to read full paper")
 
 
-# ✅ FIX: load summaries instead of JSON papers
 def load_papers():
     papers = []
+
+    # ✅ SAFE CHECK (prevents crash)
+    if not os.path.exists(SUMMARIES_DIR):
+        st.error(f"❌ Folder not found: {SUMMARIES_DIR}")
+        st.stop()
+
     files = [f for f in os.listdir(SUMMARIES_DIR) if f.endswith(".txt")]
+
+    if not files:
+        st.warning("⚠️ No .txt files found in summaries folder")
+        return papers
 
     for filename in files:
         paper_id = filename.replace(".txt", "")
         path = os.path.join(SUMMARIES_DIR, filename)
 
-        with open(path, encoding="utf-8") as f:
-            content = f.read()
+        try:
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
 
-        papers.append({
-            "id": paper_id,
-            "title": paper_id,
-            "summary": content
-        })
+            papers.append({
+                "id": paper_id,
+                "title": paper_id,
+                "summary": content
+            })
+        except Exception as e:
+            st.warning(f"Error reading {filename}: {e}")
 
     return papers
-
-
-# ❌ removed old load_summary (not needed anymore)
 
 
 def show_paper_card(paper):

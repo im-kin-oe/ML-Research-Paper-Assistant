@@ -1,0 +1,840 @@
+{
+  "id": "2604.09419",
+  "title": "NOMAD: Generating Embeddings for Massive Distributed Graphs",
+  "authors": [
+    "Aishwarya Sarkar1, Sayan Ghosh2, Nathan R. Tallent2, Ali Jannesari1"
+  ],
+  "abstract": "Abstract Successful machine learning on graphs or networks requires embeddings that not only represent nodes and edges as low-dimensional vectors but also preserve the graph structure. Established methods for generating embeddings require flexible exploration of the entire graph through repeated use of random walks that capture graph structure with samples of nodes and edges. These methods create scalability challenges for massive graphs with millions-to-billions of edges because single-node solutions have inadequate memory and processing capabilities. We present Nomad , a distributed-memory graph embedding framework using the Message Passing Interface (MPI) for distributed graphs. Nomad implements proximity-based models proposed in the widely popular LINE (Large-scale Information Network Embedding) algorithm. We propose several practical trade-offs to improve the scalability and communication overheads confronted by irregular and distributed graph embedding methods, catering to massive-scale graphs arising in web and science domains. Nomad demonstrates median speedups of 10/100 x on CPU-based NERSC Perlmutter cluster relative to the popular reference implementations of multi-threaded LINE and node2vec, 35–76 x over distributed PBG, and competitive embedding quality relative to LINE, node2vec, and GraphVite, while yielding 12–370 x end-to-end speedups on real-world graphs.",
+  "sections": [
+    {
+      "heading": "I Introduction",
+      "body": "Graphs are ubiquitous in modeling complex systems and representing entity interactions to uncover a domain’s structural information. Graph representation learning broadly spans shallow transductive methods (proximity-based) that learn directly from graph structure and inductive message-passing models (graph neural networks (GNNs)) that additionally rely on node features and supervision (labels) . Proximity-based methods such as LINE , DeepWalk , and node2vec belong to the former class, learning node representations from sampled pairs derived from edge lists or breadth/depth-first traversals or that generate random sequences from a probability distribution. Walk-based methods such as DeepWalk and node2vec derive training pairs from multi-hop co-occurrence context, whereas LINE directly optimizes sampled proximity pairs (faster on massive graphs). For many real-world large scientific and web graphs, attributes and labels may be incomplete, noisy, heterogeneous, or unavailable making GNN training less effective or harder to apply directly . In such cases, structure-only methods are a more practical choice for unsupervised learning and can also provide useful initial node representations for downstream supervised GNNs, when informative node features are missing/unreliable. Traditional dimensionality-reduction approaches are typically quadratic in the number of vertices and therefore intractable for medium-to-large graphs . For large graphs with millions to billions of nodes and edges, such as the web-scale and scientific graphs found in biology and chemistry, embedding generation becomes a major systems bottleneck due to irregular memory access, limited locality, and high communication overhead. This cost stems from repeated random-walk exploration and training on the resulting sampled pairs, which expose irregular communication and load imbalance at scale. Random walks remain a standard mechanism for extracting structural information for graph embedding, irrespective of specific walk biases used to generate the node sequences . However, although state-of-the-art shallow embedding systems exploit multithreading and other within-node optimizations, they remain constrained by node memory capacity, and methods that preserve global network properties often require synchronization patterns that do not scale well across distributed memory . Prior efforts on distributed graph embeddings either focus on accelerating a part of the pipeline (like random walks ) or rely on parameter-server architecture (to manage and synchronize shared model parameters) with limited scalability potential across nodes. Parallelism based on graph partitions alone cannot scale this problem without specific interventions since inherent irregularities in the graph partitions cause load imbalance (partitioning is NP-hard ). At scale, graph-induced access patterns require both memory capacity and sufficient compute concurrency, making single-node scale-up approaches insufficient, necessitating distributed scale-out over partitioned graphs. Capacity alone is not enough: without proportional bandwidth and compute, disaggregated or pooled memory cannot effectively sustain embedding generation for these irregular workloads . Table I summarizes the design space of representative graph embedding systems across relevant dimensions, including hardware platform, end-to-end sampling and training support, and scale-up/scale-out capabilities. Single-node CPU/GPU based embedding generation can drive node throughput through optimized memory layouts, concurrency, host-device overlap, and cache-efficient sampling . But such optimizations fall apart on distributed-memory considering partitioned graphs, which must reconcile with irregular data intensive graph exploration (either through structure-preserving random walks or weighted edge sampling), coordination with training and managing synchronization overheads. Consequently, existing distributed GPU approaches consider either sampling or training, but not both as part of the same system. We propose Nomad , a distributed-memory scalable proximity-based end-to-end graph embedding generator (that learns from sampled positive/negative pairs similar to LINE , DeepWalk , and node2vec ). Nomad proposes several communication-avoiding and synchronization trade-offs while preserving acceptable embedding accuracy. For wide portability, Nomad uses MPI collectives to efficiently handle non-uniform communication volumes across non-uniform process sets. Our contributions are: 1. Distributed-memory implementation of the popular second-order proximity model of LINE. Distributed-memory implementation of the popular second-order proximity model of LINE. 2. Several performance/quality trade-offs for distributed random walk exploration that enable Nomad to enhance communication/synchronization efficiency. Several performance/quality trade-offs for distributed random walk exploration that enable Nomad to enhance communication/synchronization efficiency. 3. Detailed quality and performance evaluation on NERSC Perlmutter across diverse large-scale graphs, showing up to 370 x 370 speedup over strong single-node baselines and 35 35 – 76 x 76 speedup over distributed-memory baselines, and competitive embedding quality. Detailed quality and performance evaluation on NERSC Perlmutter across diverse large-scale graphs, showing up to 370 x 370 speedup over strong single-node baselines and 35 35 – 76 x 76 speedup over distributed-memory baselines, and competitive embedding quality. The paper is organized as follows: § II reviews proximity-based embedding and distributed tradeoffs, § III discusses related work, § IV presents Nomad ’s distributed methodology, and § V reports quality and performance evaluations."
+    },
+    {
+      "heading": "II Background",
+      "body": "Proximity-based embedding models learn low-dimensional vertex representations by optimizing over large collections of independently sampled training pairs of vertices of an arbitrary graph G = ( V , E ) G=(V,E) , treating these pairs as the fundamental unit of parallelism. A positive pair ( u , v ) : G = ( V , E ) s . t . { u , v } ∈ E ∣ u ∈ V a n d v ∈ V (u,v):G=(V,E)\\;s.t.\\;\\{u,v\\} E u V\\;and\\;v V denotes two vertices that are structurally similar (or, closer), typically extracted from local graph neighborhoods or co-occurrence within short random walks, while a negative pair ( u , v − ) : G = ( V , E ) s . t . { u , v − } ∉ E ∣ u ∈ V a n d v − ∈ V (u,v^{-}):G=(V,E)\\;s.t.\\;\\{u,v^{-}\\} E u V\\;and\\;v^{-} V puts the target vertex u u against a randomly sampled vertex v − v^{-} that does not appear in the same context, providing a stabilizing signal during training . Each node is associated with two low-dimensional vectors, a vertex embedding U U and a context embedding C C , whose dot product determines similarity. At scale, embedding computation itself is lightweight, consisting primarily of vector dot products and updates. DeepWalk and node2vec treat random walks as “sentences” and optimize skip-gram-style objectives over the resulting co-occurrences, while LINE trains on edge- or proximity-derived pairs with similar updates . The dominant cost is instead generating and exchanging sufficient positive pairs under irregular traversal, skewed degree distributions, and limited locality. In distributed memory, many pairs span partitions and require remote embedding access (naive synchronization is not scalable), so practical systems must exploit pair-level parallelism while tolerating bounded staleness and amortizing communication across batches. We consider a graph G = ( V , E ) G=(V,E) distributed across p p processes. Each process p p owns a disjoint subset of vertices V p ⊂ V V_{p} V and their associated edges E p E_{p} . Our default distribution is 1D vertex-based, so each process owns roughly | V | / p |V|/p vertices and their edges. To improve file I/O, we convert the input graph from native ASCII to binary CSR and apply a first-fit heuristic to seek edge-balanced 1D partitions, falling back to the standard distribution if balancing fails within one iteration. Nomad enforeces an owner-computes model: each embedding is updated only by its owner, while remote processes exchange embeddings through point-to-point messages that are later incorporated into local training. Because training data is sampled independently from each process’s partition, updates proceed asynchronously with periodic communication and synchronization. Propagating every context or vertex update immediately to all remote copies would incur prohibitive overhead and introduce circular dependencies at scale. Nomad therefore permits bounded staleness (Fig. 1 ), allowing processes to continue training with fetched remote context vectors and reconcile updates periodically."
+    },
+    {
+      "heading": "III Related Work",
+      "body": "PecanPy and GRAPE improve within-node sampling and training efficiency, while GraphVite combines CPU sampling with GPU training for high single-node throughput. Unlike Nomad , these systems address scale-up and not scale-out, and benefit from co-located memory and avoid the communication, synchronization, and cross-partition irregularity that become first-order bottlenecks for large graphs where the graph and training must be distributed across nodes. We therefore discuss these systems as related work rather than primary baselines for distributed-memory scale-out. PyTorch-BigGraph (PBG) is the closest distributed baseline to Nomad in scale-out capability and is therefore included in our evaluation. It uses a parameter-server architecture with asynchronous updates over edge buckets, avoiding random-walk sampling and shifting the dominant cost to parameter synchronization rather than sampled-pair generation . Fast-Node2Vec targets the node2vec objective using biased second-order random walks within a Pregel-like bulk-synchronous execution model . As a result, its scalability is strongly shaped by the cost of maintaining biased walk state and by communication associated with high-degree vertices, which differs from the first-order weighted walks used by Nomad solely to construct positive pairs. Therefore, we do not treat it as a direct baseline for the distributed-memory LINE-style regime targeted in this paper. Other distributed graph representation systems target different objectives from Nomad . For example, distributed linear-algebra-based approaches reformulate embedding generation with sparse matrix kernels rather than stochastic sampled-pair generation, while information-oriented walk systems such as DistGER use entropy or correlation-guided walks instead of fixed-length proximity-preserving walks. These systems address different algorithmic and systems bottlenecks from those studied in Nomad , and are not directly comparable to systems that preserve LINE/node2vec-style proximity semantics, which is adopted in Nomad ’s owner-computes paradigm (see § II ). A separate line of work accelerates graph sampling without embedding training. CuGraph , NextDoor , C-SAW , and gSampler focus on random walk or neighborhood sampling, but do not provide an end-to-end embedding system. For large graphs, sampling alone is insufficient as an end-to-end baseline, as decoupling sampling from training introduces intermediate copies, redistributions, and coarse-grain synchronization. Nomad instead co-designs sampling and training for distributed-memory embedding generation."
+    },
+    {
+      "heading": "IV Methods",
+      "body": "In this section, we discuss the design of distributed training (§ IV-A ), generating random samples for training Nomad (§ IV-B ) and performance/quality considerations leading to several variants of distributed random walks (§ IV-C ). Training proceeds in batches (Algorithm 1 ). For each batch, process p p samples positive node pairs 𝒫 such that ( u , v ) ∈ 𝒫 (u,v) satisfies owner ​ ( u ) = p (u)=p (Line 3 ); thus u u is always local, while v v may be local or remote. For each positive pair, Nomad draws K K negative samples from the global degree-based distribution ( d ​ ( v ) d(v) denote the out degree of node v v ): following standard word-embedding practice . A negative pair is formed as ( u , v − ) (u,v^{-}) with v − ∼ q ​ ( ⋅ ) v^{-} q() (Line 13 ), biasing negatives toward high-degree nodes to improve stability and convergence on skewed graphs. Negative pairs are sampled independently of partition boundaries and may therefore involve remote vertices. By requiring only the target node u u to be locally owned, Nomad maximizes asynchrony across processes and avoids conflicting target-embedding updates; sampled remote vertices are buffered locally so communication can be batched and amortized across batches. For training pairs whose target and context vertices are owned by the same process, updates are applied immediately without communication or synchronization (Line 6 – 18 ). For a sampled pair ( u , v ) (u,v) with owner ​ ( u ) = owner ​ ( v ) = p (u)=(v)=p , process p p computes the gradients with respect to 𝐔 ​ [ u ] [u] and 𝐂 ​ [ v ] [v] and updates them locally; locally owned negative samples are handled identically. These updates follow stochastic gradient descent (Line 32 – 39 ): where g g is the signed gradient scalar for the sampled positive or negative interaction. When load imbalance is low (i.e., the standard deviation of local edge counts E p E_{p} , denoted σ E p _{E_{p}} , is small), larger batches increase the fraction of locally resolvable updates and reduce the relative communication imbalance. When a sampled pair involves a context vertex v v not owned by process p p , updates are deferred rather than applied remotely or synchronized immediately, and computation proceeds on a locally available copy of the remote embedding. During batch training, p p buffers remote context vertices from positive and negative samples (Line 11 , 18 ). After local updates complete, processes issue MPI_Alltoallv to exchange only the remote context embeddings needed by the current batch, keeping communication bounded (Line 20 ). Once available locally, the corresponding gradient updates are accumulated into a delta vector for each remote vertex (Line 21 – 29 ): The sum aggregates all contributions involving v v within the batch, so Δ ​ [ v ] [v] is the net update to remote C ​ [ v ] C[v] . After the batch, the accumulated Δ is exchanged via MPI_Alltoallv (Line 30 ), allowing each owner to apply the received deltas to its local context embeddings. Thus, all updates to a given embedding within a batch are applied by its owner. MPI neighborhood collectives could replace regular collectives for positive edges, since remote vertices reside on adjacent processes that share boundary nodes in the partitioned graph. However, for the randomly sampled negative edges, since they can be selected from non-adjacent processes, the existing communicator with the virtual process topology holding subsets of the partitioned graph would not suffice, and a new communicator must be created to which the resulting topology must be attached, which is an expensive operation (must be initiated every batch as needed). We attempted to use MPI neighborhood collective, choosing negative samples from the adjacent processes, but found the neighbor collective performance to be subpar and quality declined due to constraining the negative samples from process neighborhood. Algorithm 2 briefly illustrates our MPI-based random walk implementation. We use an iterative design that continues until the global walk length reaches a specified limit. During initialization, each process prepares lists of send targets and receive sources; the enumerate routine returns a process and its index from these lists (e.g., Line 5 ). For each source and target, user-defined buffers of size S ​ I ​ Z ​ E SIZE store intermediate edges along the walk path. The walk starts from an arbitrary edge { u , v } \\{u,v\\} , where u u is locally owned and v v may be local or remote, and inserts frontiers into queues for level-by-level exploration, similar to distributed Breadth First Search except that vertices may be revisited. Nonblocking receives are pre-posted (Line 15 ) to improve small-message performance (eager mode of MPI, common scenario since we periodically poke progress despite buffering). Lines 24 – 29 correspond to the local portion of the walk, where the next frontier is sampled from a discrete distribution over locally owned weighted edges. Posted nonblocking sends are tested (Lines 47 – 48 ), and completed buffers, counters, and request handles are reset. As the global step counter reaches the limit, a final round of zero-length messages is flushed to prepare for exit (Line 19 ). Within the main loop, incoming requests are tested (starting at Line 37 ) and inserted into the next-frontier queue; the current and next queues are swapped if the walk continues (Line 52 ). Algorithm 3 repeatedly invokes random walks (Algorithm 2 ) from roots sampled from a weight-normalized edge distribution until sufficient global samples (corresponding to the user-specified batch size) are collected for the current batch (Lines 6 – 7 ). This requires global synchronization to determine the exit condition (Line 8 ), with two options: terminate when at least one process reaches the target batch size, or only when all processes do. We use MPI_Allreduce for the former and a nonblocking MPI barrier for the latter (Lines 13 – 20 ). Each process invokes the nonblocking barrier after collecting the required number of batches; completion is detected when all processes in the communicator have entered the barrier and the associated MPI request handle returned true. This synchronization choice affects per-process working sets and can either worsen or ameliorate load imbalance and scalability, depending on the input. After random-walk generation completes, the remote portion of the collected samples is assembled via MPI_Alltoallv (after exiting the loop between Lines 4 – 20 ), as shown in Line 21 (deliberately excluded from Algorithm 2 to reduce the communication overhead). Sampling drives Nomad ’s performance at scale, so we propose several trade-offs to mitigate the communication costs induced by irregular graph structure. Under the SPMD model, all processes participate in sampling and communication, making design choices largely dependent on the resulting load imbalance and synchronization overhead during repeated random walks. Following Algorithms 1 , 2 , and 3 , the overall communication cost of Nomad can be represented by Eqn. 5 , which spans both sampling and training over all batches. Eqn. 5 shows that in distributed memory, random sampling is the scalability bottleneck because training cannot proceed until samples are generated. For irregular traversals, communication buffers are kept small to limit load imbalance by frequently ensuring communication progress ( S ​ I ​ Z ​ E = 128 SIZE=128 in Nomad ). Reducing communication costs during sampling is critical. As shown in Algorithm 3 , we therefore consider both nonblocking-barrier and all-reduce-based synchronization, along with variants that reduce the number of distributed walks by augmenting vertex pairs, reusing pairs from prior walks (current samples are pruned to the batch size; Line 22 ), or generating samples upfront outside the training loop (before Line 2 in Algorithm 1 ). Since load imbalance can arise either from partitioning or from insufficient samples on a process (depending on the synchronization strategy (Algorithm 3 ), with the latter often more detrimental because communication dominates, distributed random-walk sampling presents trade-offs among sample quality , communication/synchronization cost , and memory requirement . We explore this design space through six Nomad random-walk variants, each representing a distinct tradeoff point. 1. Local : Each process walks only over locally owned vertices, terminating when the next vertex is remote (Lines 24 – 29 , Algorithm 2 ). This is the most scalable variant (avoids communication), but limited exploration may require multiple walk invocations from different roots to generate sufficient training samples, potentially reducing quality. Local : Each process walks only over locally owned vertices, terminating when the next vertex is remote (Lines 24 – 29 , Algorithm 2 ). This is the most scalable variant (avoids communication), but limited exploration may require multiple walk invocations from different roots to generate sufficient training samples, potentially reducing quality. 2. Remote (Fresh-Only) : This variant is invoked within the training loop (e.g., Line 3 of Algorithm 1 ), so each batch is built from newly generated remote walks, prioritizing sample quality over reuse. However, invoking distributed remote walks hundreds to thousands of times per batch introduces substantial communication overhead and high susceptibility to load imbalance. Remote (Fresh-Only) : This variant is invoked within the training loop (e.g., Line 3 of Algorithm 1 ), so each batch is built from newly generated remote walks, prioritizing sample quality over reuse. However, invoking distributed remote walks hundreds to thousands of times per batch introduces substantial communication overhead and high susceptibility to load imbalance. 3. Remote (Reuse-Spill) : To amortize random-sample generation, this variant retains unused samples from prior batches in a persistent “spill” buffer, at the cost of extra memory. Instead of discarding samples beyond the batch limit as in Remote (Fresh-Only) (Line 22 , Algorithm 3 ), it reuses them in later batches before invoking additional remote walks, reducing communication at scale. However, quality can degrade when later batches rely primarily on stale spill-buffer samples rather than fresh walks. Remote (Reuse-Spill) : To amortize random-sample generation, this variant retains unused samples from prior batches in a persistent “spill” buffer, at the cost of extra memory. Instead of discarding samples beyond the batch limit as in Remote (Fresh-Only) (Line 22 , Algorithm 3 ), it reuses them in later batches before invoking additional remote walks, reducing communication at scale. However, quality can degrade when later batches rely primarily on stale spill-buffer samples rather than fresh walks. 4. Remote (Refresh-Spill) : Like reuse-spill, this variant uses a spill buffer while invoking random walks within the training loop, but spilled samples are discarded after one time use (only from previous batch) rather than retained indefinitely. This mitigates sample bias while still amortizing communication across batches. Relative to reuse-spill, it improves sample quality at the cost of higher synchronization overhead. Remote (Refresh-Spill) : Like reuse-spill, this variant uses a spill buffer while invoking random walks within the training loop, but spilled samples are discarded after one time use (only from previous batch) rather than retained indefinitely. This mitigates sample bias while still amortizing communication across batches. Relative to reuse-spill, it improves sample quality at the cost of higher synchronization overhead. 5. Remote (Augmented-Single) : This variant performs a single long walk from one root, with walk length scaled to batchsize x #batches, before training begins. It is the slowest variant because samples for all batches must be generated upfront. The resulting samples are also augmented from a single traversal root, which can degrade quality. Remote (Augmented-Single) : This variant performs a single long walk from one root, with walk length scaled to batchsize x #batches, before training begins. It is the slowest variant because samples for all batches must be generated upfront. The resulting samples are also augmented from a single traversal root, which can degrade quality. 6. Remote (Augmented-Pair) : This variant also decouples sampling from training by generating samples upfront, but invokes remote walks only until roughly b ​ a ​ t ​ c ​ h ​ s ​ i ​ z ​ e x # ​ b ​ a ​ t ​ c ​ h ​ e ​ s x 2 pairs are collected, then expands them by enumerating additional pair combinations. Unlike Augmented-Single, whose upfront samples are always positive, Augmented-Pair can introduce negative pairs through recombination. Its goal is to reduce load imbalance (no variation in min/max samples as in the non-augmented remote variants) by giving each process the same number of samples (middle ground between Local and rest of the Remote variants). Both augmented variants use MPI_Ibarrier -based synchronization (see § IV-B ) to ensure sufficient sample availability. Remote (Augmented-Pair) : This variant also decouples sampling from training by generating samples upfront, but invokes remote walks only until roughly b ​ a ​ t ​ c ​ h ​ s ​ i ​ z ​ e x # ​ b ​ a ​ t ​ c ​ h ​ e ​ s x 2 pairs are collected, then expands them by enumerating additional pair combinations. Unlike Augmented-Single, whose upfront samples are always positive, Augmented-Pair can introduce negative pairs through recombination. Its goal is to reduce load imbalance (no variation in min/max samples as in the non-augmented remote variants) by giving each process the same number of samples (middle ground between Local and rest of the Remote variants). Both augmented variants use MPI_Ibarrier -based synchronization (see § IV-B ) to ensure sufficient sample availability."
+    },
+    {
+      "heading": "IV-A Distributed Training",
+      "body": "Training proceeds in batches (Algorithm 1 ). For each batch, process p p samples positive node pairs 𝒫 such that ( u , v ) ∈ 𝒫 (u,v) satisfies owner ​ ( u ) = p (u)=p (Line 3 ); thus u u is always local, while v v may be local or remote. For each positive pair, Nomad draws K K negative samples from the global degree-based distribution ( d ​ ( v ) d(v) denote the out degree of node v v ): following standard word-embedding practice . A negative pair is formed as ( u , v − ) (u,v^{-}) with v − ∼ q ​ ( ⋅ ) v^{-} q() (Line 13 ), biasing negatives toward high-degree nodes to improve stability and convergence on skewed graphs. Negative pairs are sampled independently of partition boundaries and may therefore involve remote vertices. By requiring only the target node u u to be locally owned, Nomad maximizes asynchrony across processes and avoids conflicting target-embedding updates; sampled remote vertices are buffered locally so communication can be batched and amortized across batches. For training pairs whose target and context vertices are owned by the same process, updates are applied immediately without communication or synchronization (Line 6 – 18 ). For a sampled pair ( u , v ) (u,v) with owner ​ ( u ) = owner ​ ( v ) = p (u)=(v)=p , process p p computes the gradients with respect to 𝐔 ​ [ u ] [u] and 𝐂 ​ [ v ] [v] and updates them locally; locally owned negative samples are handled identically. These updates follow stochastic gradient descent (Line 32 – 39 ): where g g is the signed gradient scalar for the sampled positive or negative interaction. When load imbalance is low (i.e., the standard deviation of local edge counts E p E_{p} , denoted σ E p _{E_{p}} , is small), larger batches increase the fraction of locally resolvable updates and reduce the relative communication imbalance. When a sampled pair involves a context vertex v v not owned by process p p , updates are deferred rather than applied remotely or synchronized immediately, and computation proceeds on a locally available copy of the remote embedding. During batch training, p p buffers remote context vertices from positive and negative samples (Line 11 , 18 ). After local updates complete, processes issue MPI_Alltoallv to exchange only the remote context embeddings needed by the current batch, keeping communication bounded (Line 20 ). Once available locally, the corresponding gradient updates are accumulated into a delta vector for each remote vertex (Line 21 – 29 ): The sum aggregates all contributions involving v v within the batch, so Δ ​ [ v ] [v] is the net update to remote C ​ [ v ] C[v] . After the batch, the accumulated Δ is exchanged via MPI_Alltoallv (Line 30 ), allowing each owner to apply the received deltas to its local context embeddings. Thus, all updates to a given embedding within a batch are applied by its owner. MPI neighborhood collectives could replace regular collectives for positive edges, since remote vertices reside on adjacent processes that share boundary nodes in the partitioned graph. However, for the randomly sampled negative edges, since they can be selected from non-adjacent processes, the existing communicator with the virtual process topology holding subsets of the partitioned graph would not suffice, and a new communicator must be created to which the resulting topology must be attached, which is an expensive operation (must be initiated every batch as needed). We attempted to use MPI neighborhood collective, choosing negative samples from the adjacent processes, but found the neighbor collective performance to be subpar and quality declined due to constraining the negative samples from process neighborhood."
+    },
+    {
+      "heading": "IV-B Random Sampling",
+      "body": "Algorithm 2 briefly illustrates our MPI-based random walk implementation. We use an iterative design that continues until the global walk length reaches a specified limit. During initialization, each process prepares lists of send targets and receive sources; the enumerate routine returns a process and its index from these lists (e.g., Line 5 ). For each source and target, user-defined buffers of size S ​ I ​ Z ​ E SIZE store intermediate edges along the walk path. The walk starts from an arbitrary edge { u , v } \\{u,v\\} , where u u is locally owned and v v may be local or remote, and inserts frontiers into queues for level-by-level exploration, similar to distributed Breadth First Search except that vertices may be revisited. Nonblocking receives are pre-posted (Line 15 ) to improve small-message performance (eager mode of MPI, common scenario since we periodically poke progress despite buffering). Lines 24 – 29 correspond to the local portion of the walk, where the next frontier is sampled from a discrete distribution over locally owned weighted edges. Posted nonblocking sends are tested (Lines 47 – 48 ), and completed buffers, counters, and request handles are reset. As the global step counter reaches the limit, a final round of zero-length messages is flushed to prepare for exit (Line 19 ). Within the main loop, incoming requests are tested (starting at Line 37 ) and inserted into the next-frontier queue; the current and next queues are swapped if the walk continues (Line 52 ). Algorithm 3 repeatedly invokes random walks (Algorithm 2 ) from roots sampled from a weight-normalized edge distribution until sufficient global samples (corresponding to the user-specified batch size) are collected for the current batch (Lines 6 – 7 ). This requires global synchronization to determine the exit condition (Line 8 ), with two options: terminate when at least one process reaches the target batch size, or only when all processes do. We use MPI_Allreduce for the former and a nonblocking MPI barrier for the latter (Lines 13 – 20 ). Each process invokes the nonblocking barrier after collecting the required number of batches; completion is detected when all processes in the communicator have entered the barrier and the associated MPI request handle returned true. This synchronization choice affects per-process working sets and can either worsen or ameliorate load imbalance and scalability, depending on the input. After random-walk generation completes, the remote portion of the collected samples is assembled via MPI_Alltoallv (after exiting the loop between Lines 4 – 20 ), as shown in Line 21 (deliberately excluded from Algorithm 2 to reduce the communication overhead)."
+    },
+    {
+      "heading": "IV-C Variants of random walks",
+      "body": "Sampling drives Nomad ’s performance at scale, so we propose several trade-offs to mitigate the communication costs induced by irregular graph structure. Under the SPMD model, all processes participate in sampling and communication, making design choices largely dependent on the resulting load imbalance and synchronization overhead during repeated random walks. Following Algorithms 1 , 2 , and 3 , the overall communication cost of Nomad can be represented by Eqn. 5 , which spans both sampling and training over all batches. Eqn. 5 shows that in distributed memory, random sampling is the scalability bottleneck because training cannot proceed until samples are generated. For irregular traversals, communication buffers are kept small to limit load imbalance by frequently ensuring communication progress ( S ​ I ​ Z ​ E = 128 SIZE=128 in Nomad ). Reducing communication costs during sampling is critical. As shown in Algorithm 3 , we therefore consider both nonblocking-barrier and all-reduce-based synchronization, along with variants that reduce the number of distributed walks by augmenting vertex pairs, reusing pairs from prior walks (current samples are pruned to the batch size; Line 22 ), or generating samples upfront outside the training loop (before Line 2 in Algorithm 1 ). Since load imbalance can arise either from partitioning or from insufficient samples on a process (depending on the synchronization strategy (Algorithm 3 ), with the latter often more detrimental because communication dominates, distributed random-walk sampling presents trade-offs among sample quality , communication/synchronization cost , and memory requirement . We explore this design space through six Nomad random-walk variants, each representing a distinct tradeoff point. 1. Local : Each process walks only over locally owned vertices, terminating when the next vertex is remote (Lines 24 – 29 , Algorithm 2 ). This is the most scalable variant (avoids communication), but limited exploration may require multiple walk invocations from different roots to generate sufficient training samples, potentially reducing quality. Local : Each process walks only over locally owned vertices, terminating when the next vertex is remote (Lines 24 – 29 , Algorithm 2 ). This is the most scalable variant (avoids communication), but limited exploration may require multiple walk invocations from different roots to generate sufficient training samples, potentially reducing quality. 2. Remote (Fresh-Only) : This variant is invoked within the training loop (e.g., Line 3 of Algorithm 1 ), so each batch is built from newly generated remote walks, prioritizing sample quality over reuse. However, invoking distributed remote walks hundreds to thousands of times per batch introduces substantial communication overhead and high susceptibility to load imbalance. Remote (Fresh-Only) : This variant is invoked within the training loop (e.g., Line 3 of Algorithm 1 ), so each batch is built from newly generated remote walks, prioritizing sample quality over reuse. However, invoking distributed remote walks hundreds to thousands of times per batch introduces substantial communication overhead and high susceptibility to load imbalance. 3. Remote (Reuse-Spill) : To amortize random-sample generation, this variant retains unused samples from prior batches in a persistent “spill” buffer, at the cost of extra memory. Instead of discarding samples beyond the batch limit as in Remote (Fresh-Only) (Line 22 , Algorithm 3 ), it reuses them in later batches before invoking additional remote walks, reducing communication at scale. However, quality can degrade when later batches rely primarily on stale spill-buffer samples rather than fresh walks. Remote (Reuse-Spill) : To amortize random-sample generation, this variant retains unused samples from prior batches in a persistent “spill” buffer, at the cost of extra memory. Instead of discarding samples beyond the batch limit as in Remote (Fresh-Only) (Line 22 , Algorithm 3 ), it reuses them in later batches before invoking additional remote walks, reducing communication at scale. However, quality can degrade when later batches rely primarily on stale spill-buffer samples rather than fresh walks. 4. Remote (Refresh-Spill) : Like reuse-spill, this variant uses a spill buffer while invoking random walks within the training loop, but spilled samples are discarded after one time use (only from previous batch) rather than retained indefinitely. This mitigates sample bias while still amortizing communication across batches. Relative to reuse-spill, it improves sample quality at the cost of higher synchronization overhead. Remote (Refresh-Spill) : Like reuse-spill, this variant uses a spill buffer while invoking random walks within the training loop, but spilled samples are discarded after one time use (only from previous batch) rather than retained indefinitely. This mitigates sample bias while still amortizing communication across batches. Relative to reuse-spill, it improves sample quality at the cost of higher synchronization overhead. 5. Remote (Augmented-Single) : This variant performs a single long walk from one root, with walk length scaled to batchsize x #batches, before training begins. It is the slowest variant because samples for all batches must be generated upfront. The resulting samples are also augmented from a single traversal root, which can degrade quality. Remote (Augmented-Single) : This variant performs a single long walk from one root, with walk length scaled to batchsize x #batches, before training begins. It is the slowest variant because samples for all batches must be generated upfront. The resulting samples are also augmented from a single traversal root, which can degrade quality. 6. Remote (Augmented-Pair) : This variant also decouples sampling from training by generating samples upfront, but invokes remote walks only until roughly b ​ a ​ t ​ c ​ h ​ s ​ i ​ z ​ e x # ​ b ​ a ​ t ​ c ​ h ​ e ​ s x 2 pairs are collected, then expands them by enumerating additional pair combinations. Unlike Augmented-Single, whose upfront samples are always positive, Augmented-Pair can introduce negative pairs through recombination. Its goal is to reduce load imbalance (no variation in min/max samples as in the non-augmented remote variants) by giving each process the same number of samples (middle ground between Local and rest of the Remote variants). Both augmented variants use MPI_Ibarrier -based synchronization (see § IV-B ) to ensure sufficient sample availability. Remote (Augmented-Pair) : This variant also decouples sampling from training by generating samples upfront, but invokes remote walks only until roughly b ​ a ​ t ​ c ​ h ​ s ​ i ​ z ​ e x # ​ b ​ a ​ t ​ c ​ h ​ e ​ s x 2 pairs are collected, then expands them by enumerating additional pair combinations. Unlike Augmented-Single, whose upfront samples are always positive, Augmented-Pair can introduce negative pairs through recombination. Its goal is to reduce load imbalance (no variation in min/max samples as in the non-augmented remote variants) by giving each process the same number of samples (middle ground between Local and rest of the Remote variants). Both augmented variants use MPI_Ibarrier -based synchronization (see § IV-B ) to ensure sufficient sample availability."
+    },
+    {
+      "heading": "V Results",
+      "body": "We evaluate Nomad on real-world graphs with varied parameterizations (§ V-A ), evaluate baseline comparisons (§ V-B ), discuss quality/performance tradeoffs relative to state-of-practice (§ V-C ), and analyze performance trade-offs(§ V-D ). We evaluate Nomad on diverse real-world graph datasets spanning citation, social, and web networks (Table II ); several are accessed through DGL’s dataset APIs, while the original sources are listed in the table. We convert the graphs from native format to an undirected binary CSR representation for efficient I/O. To characterize partition irregularity (see § IV ), we report the standard deviation of edges across processes, σ E p _{E_{p}} , since higher values can worsen load imbalance. Table II also highlights the best observed speedup for each input across process configurations and variants. Experiments are performed on the NERSC Perlmutter consisting of 3,072 CPU-only compute nodes. Each node uses two 64-core AMD EPYC 7763 CPUs (128 cores / 256 threads) and 512 GB DDR4 memory, eight NUMA domains, and is connected via Slingshot 11 . We use up to 512 nodes in our experiments. Nomad is built with PrgEnv-gnu/8.5.0 (GNU v13.2), cray-libsci/24.07.0 (for BLAS sdot ) and cray-mpich/8.1.30 for building Nomad , and CrayPAT/Perftools (perftools-base/24.07.0) for profiling. Experimental variants of Nomad are denoted in this format < Sync :AR/ IBarrier (IB)>–< Variant :Local/Remote(Fresh/Reuse-Spill/Refresh-Spill/Aug-Single/Aug-Pair)>(augmented variants use IBarrier only), following § IV-B and § IV-C . We use different baselines for quality and performance comparisons. For embedding quality, we compare against the original LINE implementation , an optimized C++ implementation of node2vec , and hybrid CPU–GPU-based GraphVite (hyperparameters were matched to Nomad as closely as permitted by design). For performance, we compare Nomad against multithreaded LINE and node2vec in the shared-memory setting (128 CPU threads; max. on Perlmutter), and against PyTorch-BigGraph (PBG) in the distributed-memory setting (using recommended #partitions= 2 x 2 #nodes; a 128 partitions/node variant, evaluated for closer alignment with Nomad , was about 18 x slower). GraphVite is excluded as it is directly not comparable to Nomad in end-to-end distributed-memory performance (See § I ). Following prior work , we evaluate embedding quality using downstream multi-class node classification with a one-vs-rest logistic regression model trained on 10% labeled nodes, and report Micro-F1 and Macro-F1. Following standard settings, Nomad trains d d -dimensional embeddings using single-precision Stochastic Gradient Descent (SGD) with learning rate η (default 0.025 0.025 ), one negative sample per positive pair ( K = 1 K{=}1 ), and ℓ 2 _{2} regularization. Training uses fixed-size batches ( 100 100 – 100 100 K, depending on the input), with epochs controlling the overall budget. Random-walk sampling is parameterized by walk length (typically 100 100 ) and window size (typically 2 2 ), which determine the number and locality of positive pairs. Table II summarizes the main trends. Nomad achieves substantial end-to-end speedups across diverse graphs ( 12 x 12 – 58 x 58 on small and 167 x 167 – 370 x 370 on medium-to-large), but scalability is governed primarily by positive-pair generation rather than embedding updates (§ V-D 2 ). Nomad provides 4-291 x speedup over single-node baselines LINE and node2vec, and 35-76 x speedup over distributed-memory baseline PyTorch-BigGraph (PBG). For the single-node comparison, we evaluate Nomad on a single Perlmutter node (n=1:ppn=128) against multithreaded LINE and node2vec, which are limited to a single node with fixed memory (cannot accommodate medium-large graphs). Fig. 2 shows, Nomad maintains substantially lower end-to-end execution time. Against PBG (distributed-memory), as shown in Fig. 3 , Nomad consistently achieves lower end-to-end execution time (41–53 x speedup on physics and 35–66 x on youtube). PBG incurs substantial overhead from its edge-bucket-based partition training model, which relies on lock-based bucket scheduling, repeated swapping of partitioned embeddings, and lazy distributed parameter synchronization. These costs become pronounced when runtime is not dominated by training alone (also observed by prior work ) and increasingly expensive on very large graphs. Hence, we restrict this comparison to only medium-scale graphs. Nomad improves embedding quality by up to 29% over the strongest single-node baseline across datasets (up to 157%, 31%, and 55% over LINE, node2vec, and GraphVite). Best quality comes from variants that preserve sample integrity, while the fastest variants trade quality for execution time. Table III reports Micro-F1 and Macro-F1 for node classification using 10% labeled nodes, considering the best-performing local and remote configurations of Nomad (§ IV-C ). Overall, Nomad achieves higher or competitive quality relative to LINE, node2vec, and GraphVite across most datasets, showing that distributed execution does not compromise representation quality. On computers, physics, photo, and pubmed (small/medium-scale), Nomad improves Micro-F1 by 5–29% over the strongest single-node baseline; on larger graphs such as ogbn-products and reddit, the improvement ranges from 3–22%. On computers and photo, Nomad also achieves near-perfect Macro-F1, indicating strong class-level balance. For larger inputs such as ogbn-proteins and reddit, node2vec fails due to node-memory limitations, whereas Nomad maintains strong performance. LINE similarly exhibits degraded Macro-F1 on ogbn-arxiv and ogbn-products, suggesting limited expressiveness under high-degree and label-imbalanced settings. Overall, both local and remote Nomad variants provide strong quality guarantees on 7/9 inputs in Table III , likely because distributed-memory parallelism enables substantially more walk-derived training samples within the same experimental setting. On youtube, increasing the training budget from 10 to 100 epochs improves Nomad to 0.34/0.26 and 0.35/0.26 (Mi/Ma) for the best local and remote variants, respectively; we did not perform dataset-specific hyperparameter tuning. Fig. 4 demonstrates the quality of generated embeddings (using Micro-F1) of different variants of Nomad with increasing processes/parallelism on two diverse inputs: computers and reddit (depicts major variations in σ E p _{E_{p}} , see Table II ). Local sampling ( AR-Local ) consistently achieves high Micro-F1 across the process counts, indicating that locally generated random walks preserve the structural fidelity required for high-quality embeddings. However, as distribution increases, individual partition sizes may vary, abruptly affecting the sample quality (e.g., see computers between 4–8 and 64–128 processes in Fig. 4 ). Remote execution strategies also exhibit variations on computers (see AR-Remote trajectories). However, remote variants that generates fresh samples ( AR-Remote (Refresh/Reuse-Spill) ) demonstrate competitive qualities to the locally generated samples. As discussed in § IV-C , augmented random walks (i.e., IB-Remote (Augmented-Pair) ) can lead to subpar quality (especially for small/medium inputs) due to overabundance of negative edges in samples, with no recourse to periodically refresh (consequently, it demonstrates the least Micro-F1). Macro-F1 trends are similar. AR-Local provides best performance/quality tradeoff. AR-Remote variants deliver best embedding quality at the expense of remote communication, without necessarily affecting the performance bottom-line. Fig. 5 presents an ablation of the variants of Nomad (using both MPI_Allreduce and MPI_Ibarrier based synchronizations, (see Algorithm 3 ) for ogbn-arxiv input (the fresh-only variant is excluded since reuse/refresh-spill variants are more appropriate). We observed the same qualitative ordering of variants on other smaller inputs. The results clearly indicate that both refresh-spill and the augmented single walk versions incur the highest execution times: at least an order of magnitude higher than the rest. Refresh-spill generates fresh samples through repeated distributed random walks, requiring global synchronization several times within a batch. The augmented single walk, on the other hand, performs a single, long, distributed traversal (before entering the training loop) to generate the requisite positive sample pairs. All processes collaboratively generate positive training pairs until the slowest process reaches a global target proportional to the total number of batches. Although this design decouples sample generation from training, it introduces a substantial one time synchronization to exchange the remote pairs and materialize the entire set of positive pairs in memory upfront, stalling the training (but mitigates load imbalance within the training loop due to sampling). The combination of global synchronization and increased memory pressure makes the augmented single variant slower than reuse-based spilling, though still faster than the remote execution that repeatedly regenerates walks per batch (i.e., refresh-spill). The augmented-pair is an extension of augmented-single; instead of invoking a single long walk, it performs distributed walks for 𝔹 ⋅ b ​ a ​ t ​ c ​ h ​ s ​ i ​ z ​ e ⋅ 2 batch\\;size 2} steps where 𝔹 is the #batches. This results in a major reduction in synchronization/point-to-point communication for the random sampling portion of Eqn. 5 , at the expense of extra computation in expanding the set of positive pairs. Consequently, the augmented-pair variant outperforms the rest of the remote variants. Ultimately, the local walk version consistently achieves the least execution time, as it avoids remote communication during sampling, minimizing the load imbalance. Based on these observations, we exclude remote (refresh-spill) and augmented-single variants from the subsequent performance-oriented experiments on larger graphs and configurations. Fig. 6 evaluates the scalability of Nomad ( AR/IB-Local and remote Fresh-Only , Reuse-Spill , and Aug-Pair ) across the datasets in Table II and #processes (using 1–512 nodes; 16–128 processes-per-node). We report average end-to-end execution time, including random sampling and training. Overall, AR-Local delivers the highest speedups: 34 34 – 44 x 44 on computers, physics, pubmed, ogbn-arxiv, and reddit; 25 25 – 51 x 51 on youtube; and 18 18 – 30 x 30 on ogbn-products, ogbn-proteins, and friendster. Even on the largest graphs, where sustained scalability is difficult due to load imbalance, AR-Local remains effective on friendster ( 18 x 18 ), but scales poorly on twitter7 ( 1.12 x 1.12 ), ogbn-papers100M ( 1.05 x 1.05 ), and hyperlink2012 ( 0.90 x 0.90 ), indicating worsening imbalance at extreme scale. Even AR-Local is not immune to imbalance, as shown in Fig. 7 , which compares the distribution of positive samples across processes for the best local and remote variants. Imbalance is consistently severe for AR-Remote (Reuse-Spill) at low to moderate process counts, with the standard deviation of generated samples reaching three to four orders of magnitude, though it becomes more tolerable beyond 512 processes aside from occasional spikes (e.g., 1024 processes). For AR-Local , the severity depends on the input: ogbn-products shows only 1–2% variation in generated samples at 4096 processes, whereas youtube remains highly variable, with about 5 x 5 and 30 x 30 variation at 16 and 4096 processes, respectively (similar trend for hyperlink2012: 30 x 30 at 4096 processes). The IBarrier variants (red markers in Fig. 7 ) mitigate imbalance by enforcing per-process positive-sample quotas, but increase walk time through stronger straggler effects, as discussed next. Although Fig. 7 does not fully capture it, several factors can increase the performance variability of AR-Remote (Reuse-Spill) , as seen in Fig. 6 . When edge-balanced partitioning fails and execution falls back to the standard 1-D distribution ( | V | / p |V|/p , § II ), load imbalance can increase, as observed for ogbn-proteins and ogbn-products on 512 processes. Under AllReduce -based synchronization, spill-buffer reuse can then leave some processes with zero positive samples (e.g., ogbn-proteins on 128/256 processes), so they perform no useful work beyond collective communication and barrier waiting. This effect is more damaging to scalability than partition-induced imbalance alone and explains the sharp random-walk slowdowns and runtime variability of Reuse-Spill on ogbn-proteins, ogbn-products, reddit, and youtube in Fig. 6 . IB-Aug-Pair is less sensitive to partition-induced imbalance because it decouples sample generation from training and enforces equal sample counts across processes. This reduces synchronization and communication overhead, yielding better scalability than the other remote variants at the cost of higher memory use. On several datasets, it achieves moderate speedups ( 4 4 – 6 x 6 on computers, photo, physics, pubmed, reddit, ogbn-proteins, and ogbn-products, and 8 x 8 on ogbn-arxiv), but it does not scale on the largest graphs due to synchronization overheads, including friendster ( 0.40 x 0.40 ), ogbn-papers100M ( 0.44 x 0.44 ), twitter7 ( 0.39 x 0.39 ), hyperlink2012 ( 0.28 x 0.28 ), and youtube ( 1.47 x 1.47 ). However, because IB-Aug-Pair generates synthetic pairs, its performance advantage comes at the cost of lower per-batch sample integrity (positive pairs are no longer tied to a specific exploration). This explains why IB-Aug-Pair achieves the fastest remote execution in Fig. 6 while exhibiting subpar embedding quality in Fig. 4 . In general, Fig. 6 shows that Ibarrier -based variants incur higher execution times than their AllReduce counterparts at scale, despite reducing explicit global synchronization and load imbalance (Fig. 7 ). For example, IB-Remote (Fresh-Only) shows no scalability on reddit and youtube ( 0.38 0.38 – 0.60 x 0.60 ), while IB-Remote (Reuse-Spill) similarly degrades on ogbn-proteins ( 0.28 x 0.28 ). Although processes generate samples asynchronously, random sampling continues until all processes satisfy the predefined non-zero sample quota (§ IV-B ), increasing communication and imposing additional work even after some processes have already met their quota. Fig. 8 decomposes end-to-end time into random sampling and training for six large datasets using the best Nomad variants, AR-Local and IB-Remote Aug-Pair . The balance between sampling and training varies with graph structure (degrees, partitions, etc.) and Nomad variant, but sampling generally dominates execution time. For AR-Local , sampling always generates fresh positive pairs and is dominated by walks over the local partition; as #processes increases, partitions shrink, reducing sampling cost and bringing it closer to training. In contrast, Aug-Pair pays an upfront distributed communication cost to construct and exchange an initial pool of positive samples, after which per-batch sampling cost is negligible. At lower process counts, this amortization can outperform local sampling, but as #processes increases, the growing global communication cost eventually offsets that advantage. This crossover is visible in Fig. 8 : on twitter7 and friendster, local sampling becomes faster than Aug-Pair at 8192 processes, while on hyperlink2012 the crossover occurs between 2048 and 4096 processes. The crossover point depends on graph size and structure: it is not observed for ogbn-papers100M ( | E | = |E|= 6.4B) within the evaluated scale, but occurs earlier for medium-sized graphs such as ogbn-products and ogbn-proteins, where Aug-Pair remains slower at higher scales. We also study the impact of communication considering local and remote ( Refresh-Spill , § IV-C ) random-walk variants of Nomad with AllReduce -based synchronization using CrayPAT/PerfTools on two diverse inputs, arxiv and youtube, at 2048 processes (n=32:ppn=64; arxiv ran for 60 batches, whereas youtube ran for about 5K batches), as shown in Table IV . On arxiv, local sampling yields comparable sampling and training times, but remote sampling is about 5 x 5 more expensive than the rest of training. On youtube, the trend reverses: training costing 8–10 x more than sampling. These results corroborate the cost formulation in Eqn. 5 . On HPE/Cray systems, the NIC can track only a limited number of memory pages, so larger pages (2 MB recommended) can improve effective addressability for small- and medium-sized messages. Because huge pages are a node-level resource, availability depends on memory fragmentation, and the runtime may fall back to regular 4 KB pages; this variability is why we exclude huge pages from baseline runs. Fig. 9 evaluates 2 MB huge pages on the best remote variant of Nomad , IB-Remote (Aug-Pair) . Their impact varies by input and scale. On ogbn-papers100M, huge pages improve sampling at 2048 processes for an additional 1.14 x 1.14 speedup, and improve training at 4096 processes for a net 2 x 2 reduction in total time, suggesting better memory locality and TLB efficiency during large embedding updates rather than random walks. These benefits diminish at 8192 processes. On youtube, which has smaller per-rank graph partitions but frequent embedding updates (#epoch=100, batch size=10k), huge pages consistently reduce training time and provide up to 4 x 4 speedup on 1024–4096 processes; the default 4 KB-page baseline does not scale over this range (Fig. 6 ). On friendster, the maximum benefit is 16% at 4096 processes. We also develop an MPI-3.0 Remote Memory Access (RMA) variant of Nomad using passive-target synchronization and the unified memory model . Unlike the default collective version, which couples communication and synchronization, RMA separates them through one-sided get and accumulate operations with flush calls for local/remote completion. Local context and vertex embeddings are exposed through MPI windows. After local positive and negative updates (Lines 11 and 16 , Algorithm 1 ), a sequence of asynchronous get operations fetches the remote context/vertex vectors. A local flush completes outstanding gets, enabling the corresponding remote updates (Lines 32 – 39 ) and direct accumulation of remote deltas via RMA accumulate. A subsequent flush ensures remote completion, replacing the MPI_Alltoallv on Line 30 . Fig. 10 shows the performance of RMA variants on youtube ( AR-Remote Refresh-Spill ) and friendster ( AR-Remote Aug-Pair ) at thousands of processes (chosen due to irregularities in the edge distributions ( σ E p _{E_{p}} > > 5000)). We also evaluate a get-accumulate variant (denoted − G ​ A -GA ) in place of get ( − G -G ) to exploit atomic execution; it improves accuracy by 2–5% on these inputs, but at additional performance cost. RMA increases load imbalance in constituent routines within the training loop, particularly the repeated sampling phase of Refresh-Spill ; in contrast, imbalance is less pronounced for Aug-Pair , where the one-time sampling phase occurs outside the training loop (see § IV-C ). Despite this, most RMA configurations improve performance by 10–20%. Table V quantifies this imbalance in MPI utilization: while communication dominates in both, the default variant exhibits at most 10% imbalance, whereas RMA exceeds 50%."
+    },
+    {
+      "heading": "V-A Experimental Setup",
+      "body": "We evaluate Nomad on diverse real-world graph datasets spanning citation, social, and web networks (Table II ); several are accessed through DGL’s dataset APIs, while the original sources are listed in the table. We convert the graphs from native format to an undirected binary CSR representation for efficient I/O. To characterize partition irregularity (see § IV ), we report the standard deviation of edges across processes, σ E p _{E_{p}} , since higher values can worsen load imbalance. Table II also highlights the best observed speedup for each input across process configurations and variants. Experiments are performed on the NERSC Perlmutter consisting of 3,072 CPU-only compute nodes. Each node uses two 64-core AMD EPYC 7763 CPUs (128 cores / 256 threads) and 512 GB DDR4 memory, eight NUMA domains, and is connected via Slingshot 11 . We use up to 512 nodes in our experiments. Nomad is built with PrgEnv-gnu/8.5.0 (GNU v13.2), cray-libsci/24.07.0 (for BLAS sdot ) and cray-mpich/8.1.30 for building Nomad , and CrayPAT/Perftools (perftools-base/24.07.0) for profiling. Experimental variants of Nomad are denoted in this format < Sync :AR/ IBarrier (IB)>–< Variant :Local/Remote(Fresh/Reuse-Spill/Refresh-Spill/Aug-Single/Aug-Pair)>(augmented variants use IBarrier only), following § IV-B and § IV-C . We use different baselines for quality and performance comparisons. For embedding quality, we compare against the original LINE implementation , an optimized C++ implementation of node2vec , and hybrid CPU–GPU-based GraphVite (hyperparameters were matched to Nomad as closely as permitted by design). For performance, we compare Nomad against multithreaded LINE and node2vec in the shared-memory setting (128 CPU threads; max. on Perlmutter), and against PyTorch-BigGraph (PBG) in the distributed-memory setting (using recommended #partitions= 2 x 2 #nodes; a 128 partitions/node variant, evaluated for closer alignment with Nomad , was about 18 x slower). GraphVite is excluded as it is directly not comparable to Nomad in end-to-end distributed-memory performance (See § I ). Following prior work , we evaluate embedding quality using downstream multi-class node classification with a one-vs-rest logistic regression model trained on 10% labeled nodes, and report Micro-F1 and Macro-F1. Following standard settings, Nomad trains d d -dimensional embeddings using single-precision Stochastic Gradient Descent (SGD) with learning rate η (default 0.025 0.025 ), one negative sample per positive pair ( K = 1 K{=}1 ), and ℓ 2 _{2} regularization. Training uses fixed-size batches ( 100 100 – 100 100 K, depending on the input), with epochs controlling the overall budget. Random-walk sampling is parameterized by walk length (typically 100 100 ) and window size (typically 2 2 ), which determine the number and locality of positive pairs. Table II summarizes the main trends. Nomad achieves substantial end-to-end speedups across diverse graphs ( 12 x 12 – 58 x 58 on small and 167 x 167 – 370 x 370 on medium-to-large), but scalability is governed primarily by positive-pair generation rather than embedding updates (§ V-D 2 )."
+    },
+    {
+      "heading": "V-B Baseline Comparison",
+      "body": "Nomad provides 4-291 x speedup over single-node baselines LINE and node2vec, and 35-76 x speedup over distributed-memory baseline PyTorch-BigGraph (PBG). For the single-node comparison, we evaluate Nomad on a single Perlmutter node (n=1:ppn=128) against multithreaded LINE and node2vec, which are limited to a single node with fixed memory (cannot accommodate medium-large graphs). Fig. 2 shows, Nomad maintains substantially lower end-to-end execution time. Against PBG (distributed-memory), as shown in Fig. 3 , Nomad consistently achieves lower end-to-end execution time (41–53 x speedup on physics and 35–66 x on youtube). PBG incurs substantial overhead from its edge-bucket-based partition training model, which relies on lock-based bucket scheduling, repeated swapping of partitioned embeddings, and lazy distributed parameter synchronization. These costs become pronounced when runtime is not dominated by training alone (also observed by prior work ) and increasingly expensive on very large graphs. Hence, we restrict this comparison to only medium-scale graphs."
+    },
+    {
+      "heading": "V-C Embedding Quality",
+      "body": "Nomad improves embedding quality by up to 29% over the strongest single-node baseline across datasets (up to 157%, 31%, and 55% over LINE, node2vec, and GraphVite). Best quality comes from variants that preserve sample integrity, while the fastest variants trade quality for execution time. Table III reports Micro-F1 and Macro-F1 for node classification using 10% labeled nodes, considering the best-performing local and remote configurations of Nomad (§ IV-C ). Overall, Nomad achieves higher or competitive quality relative to LINE, node2vec, and GraphVite across most datasets, showing that distributed execution does not compromise representation quality. On computers, physics, photo, and pubmed (small/medium-scale), Nomad improves Micro-F1 by 5–29% over the strongest single-node baseline; on larger graphs such as ogbn-products and reddit, the improvement ranges from 3–22%. On computers and photo, Nomad also achieves near-perfect Macro-F1, indicating strong class-level balance. For larger inputs such as ogbn-proteins and reddit, node2vec fails due to node-memory limitations, whereas Nomad maintains strong performance. LINE similarly exhibits degraded Macro-F1 on ogbn-arxiv and ogbn-products, suggesting limited expressiveness under high-degree and label-imbalanced settings. Overall, both local and remote Nomad variants provide strong quality guarantees on 7/9 inputs in Table III , likely because distributed-memory parallelism enables substantially more walk-derived training samples within the same experimental setting. On youtube, increasing the training budget from 10 to 100 epochs improves Nomad to 0.34/0.26 and 0.35/0.26 (Mi/Ma) for the best local and remote variants, respectively; we did not perform dataset-specific hyperparameter tuning. Fig. 4 demonstrates the quality of generated embeddings (using Micro-F1) of different variants of Nomad with increasing processes/parallelism on two diverse inputs: computers and reddit (depicts major variations in σ E p _{E_{p}} , see Table II ). Local sampling ( AR-Local ) consistently achieves high Micro-F1 across the process counts, indicating that locally generated random walks preserve the structural fidelity required for high-quality embeddings. However, as distribution increases, individual partition sizes may vary, abruptly affecting the sample quality (e.g., see computers between 4–8 and 64–128 processes in Fig. 4 ). Remote execution strategies also exhibit variations on computers (see AR-Remote trajectories). However, remote variants that generates fresh samples ( AR-Remote (Refresh/Reuse-Spill) ) demonstrate competitive qualities to the locally generated samples. As discussed in § IV-C , augmented random walks (i.e., IB-Remote (Augmented-Pair) ) can lead to subpar quality (especially for small/medium inputs) due to overabundance of negative edges in samples, with no recourse to periodically refresh (consequently, it demonstrates the least Micro-F1). Macro-F1 trends are similar."
+    },
+    {
+      "heading": "V-D Performance Analysis",
+      "body": "AR-Local provides best performance/quality tradeoff. AR-Remote variants deliver best embedding quality at the expense of remote communication, without necessarily affecting the performance bottom-line. Fig. 5 presents an ablation of the variants of Nomad (using both MPI_Allreduce and MPI_Ibarrier based synchronizations, (see Algorithm 3 ) for ogbn-arxiv input (the fresh-only variant is excluded since reuse/refresh-spill variants are more appropriate). We observed the same qualitative ordering of variants on other smaller inputs. The results clearly indicate that both refresh-spill and the augmented single walk versions incur the highest execution times: at least an order of magnitude higher than the rest. Refresh-spill generates fresh samples through repeated distributed random walks, requiring global synchronization several times within a batch. The augmented single walk, on the other hand, performs a single, long, distributed traversal (before entering the training loop) to generate the requisite positive sample pairs. All processes collaboratively generate positive training pairs until the slowest process reaches a global target proportional to the total number of batches. Although this design decouples sample generation from training, it introduces a substantial one time synchronization to exchange the remote pairs and materialize the entire set of positive pairs in memory upfront, stalling the training (but mitigates load imbalance within the training loop due to sampling). The combination of global synchronization and increased memory pressure makes the augmented single variant slower than reuse-based spilling, though still faster than the remote execution that repeatedly regenerates walks per batch (i.e., refresh-spill). The augmented-pair is an extension of augmented-single; instead of invoking a single long walk, it performs distributed walks for 𝔹 ⋅ b ​ a ​ t ​ c ​ h ​ s ​ i ​ z ​ e ⋅ 2 batch\\;size 2} steps where 𝔹 is the #batches. This results in a major reduction in synchronization/point-to-point communication for the random sampling portion of Eqn. 5 , at the expense of extra computation in expanding the set of positive pairs. Consequently, the augmented-pair variant outperforms the rest of the remote variants. Ultimately, the local walk version consistently achieves the least execution time, as it avoids remote communication during sampling, minimizing the load imbalance. Based on these observations, we exclude remote (refresh-spill) and augmented-single variants from the subsequent performance-oriented experiments on larger graphs and configurations. Fig. 6 evaluates the scalability of Nomad ( AR/IB-Local and remote Fresh-Only , Reuse-Spill , and Aug-Pair ) across the datasets in Table II and #processes (using 1–512 nodes; 16–128 processes-per-node). We report average end-to-end execution time, including random sampling and training. Overall, AR-Local delivers the highest speedups: 34 34 – 44 x 44 on computers, physics, pubmed, ogbn-arxiv, and reddit; 25 25 – 51 x 51 on youtube; and 18 18 – 30 x 30 on ogbn-products, ogbn-proteins, and friendster. Even on the largest graphs, where sustained scalability is difficult due to load imbalance, AR-Local remains effective on friendster ( 18 x 18 ), but scales poorly on twitter7 ( 1.12 x 1.12 ), ogbn-papers100M ( 1.05 x 1.05 ), and hyperlink2012 ( 0.90 x 0.90 ), indicating worsening imbalance at extreme scale. Even AR-Local is not immune to imbalance, as shown in Fig. 7 , which compares the distribution of positive samples across processes for the best local and remote variants. Imbalance is consistently severe for AR-Remote (Reuse-Spill) at low to moderate process counts, with the standard deviation of generated samples reaching three to four orders of magnitude, though it becomes more tolerable beyond 512 processes aside from occasional spikes (e.g., 1024 processes). For AR-Local , the severity depends on the input: ogbn-products shows only 1–2% variation in generated samples at 4096 processes, whereas youtube remains highly variable, with about 5 x 5 and 30 x 30 variation at 16 and 4096 processes, respectively (similar trend for hyperlink2012: 30 x 30 at 4096 processes). The IBarrier variants (red markers in Fig. 7 ) mitigate imbalance by enforcing per-process positive-sample quotas, but increase walk time through stronger straggler effects, as discussed next. Although Fig. 7 does not fully capture it, several factors can increase the performance variability of AR-Remote (Reuse-Spill) , as seen in Fig. 6 . When edge-balanced partitioning fails and execution falls back to the standard 1-D distribution ( | V | / p |V|/p , § II ), load imbalance can increase, as observed for ogbn-proteins and ogbn-products on 512 processes. Under AllReduce -based synchronization, spill-buffer reuse can then leave some processes with zero positive samples (e.g., ogbn-proteins on 128/256 processes), so they perform no useful work beyond collective communication and barrier waiting. This effect is more damaging to scalability than partition-induced imbalance alone and explains the sharp random-walk slowdowns and runtime variability of Reuse-Spill on ogbn-proteins, ogbn-products, reddit, and youtube in Fig. 6 . IB-Aug-Pair is less sensitive to partition-induced imbalance because it decouples sample generation from training and enforces equal sample counts across processes. This reduces synchronization and communication overhead, yielding better scalability than the other remote variants at the cost of higher memory use. On several datasets, it achieves moderate speedups ( 4 4 – 6 x 6 on computers, photo, physics, pubmed, reddit, ogbn-proteins, and ogbn-products, and 8 x 8 on ogbn-arxiv), but it does not scale on the largest graphs due to synchronization overheads, including friendster ( 0.40 x 0.40 ), ogbn-papers100M ( 0.44 x 0.44 ), twitter7 ( 0.39 x 0.39 ), hyperlink2012 ( 0.28 x 0.28 ), and youtube ( 1.47 x 1.47 ). However, because IB-Aug-Pair generates synthetic pairs, its performance advantage comes at the cost of lower per-batch sample integrity (positive pairs are no longer tied to a specific exploration). This explains why IB-Aug-Pair achieves the fastest remote execution in Fig. 6 while exhibiting subpar embedding quality in Fig. 4 . In general, Fig. 6 shows that Ibarrier -based variants incur higher execution times than their AllReduce counterparts at scale, despite reducing explicit global synchronization and load imbalance (Fig. 7 ). For example, IB-Remote (Fresh-Only) shows no scalability on reddit and youtube ( 0.38 0.38 – 0.60 x 0.60 ), while IB-Remote (Reuse-Spill) similarly degrades on ogbn-proteins ( 0.28 x 0.28 ). Although processes generate samples asynchronously, random sampling continues until all processes satisfy the predefined non-zero sample quota (§ IV-B ), increasing communication and imposing additional work even after some processes have already met their quota. Fig. 8 decomposes end-to-end time into random sampling and training for six large datasets using the best Nomad variants, AR-Local and IB-Remote Aug-Pair . The balance between sampling and training varies with graph structure (degrees, partitions, etc.) and Nomad variant, but sampling generally dominates execution time. For AR-Local , sampling always generates fresh positive pairs and is dominated by walks over the local partition; as #processes increases, partitions shrink, reducing sampling cost and bringing it closer to training. In contrast, Aug-Pair pays an upfront distributed communication cost to construct and exchange an initial pool of positive samples, after which per-batch sampling cost is negligible. At lower process counts, this amortization can outperform local sampling, but as #processes increases, the growing global communication cost eventually offsets that advantage. This crossover is visible in Fig. 8 : on twitter7 and friendster, local sampling becomes faster than Aug-Pair at 8192 processes, while on hyperlink2012 the crossover occurs between 2048 and 4096 processes. The crossover point depends on graph size and structure: it is not observed for ogbn-papers100M ( | E | = |E|= 6.4B) within the evaluated scale, but occurs earlier for medium-sized graphs such as ogbn-products and ogbn-proteins, where Aug-Pair remains slower at higher scales. We also study the impact of communication considering local and remote ( Refresh-Spill , § IV-C ) random-walk variants of Nomad with AllReduce -based synchronization using CrayPAT/PerfTools on two diverse inputs, arxiv and youtube, at 2048 processes (n=32:ppn=64; arxiv ran for 60 batches, whereas youtube ran for about 5K batches), as shown in Table IV . On arxiv, local sampling yields comparable sampling and training times, but remote sampling is about 5 x 5 more expensive than the rest of training. On youtube, the trend reverses: training costing 8–10 x more than sampling. These results corroborate the cost formulation in Eqn. 5 . On HPE/Cray systems, the NIC can track only a limited number of memory pages, so larger pages (2 MB recommended) can improve effective addressability for small- and medium-sized messages. Because huge pages are a node-level resource, availability depends on memory fragmentation, and the runtime may fall back to regular 4 KB pages; this variability is why we exclude huge pages from baseline runs. Fig. 9 evaluates 2 MB huge pages on the best remote variant of Nomad , IB-Remote (Aug-Pair) . Their impact varies by input and scale. On ogbn-papers100M, huge pages improve sampling at 2048 processes for an additional 1.14 x 1.14 speedup, and improve training at 4096 processes for a net 2 x 2 reduction in total time, suggesting better memory locality and TLB efficiency during large embedding updates rather than random walks. These benefits diminish at 8192 processes. On youtube, which has smaller per-rank graph partitions but frequent embedding updates (#epoch=100, batch size=10k), huge pages consistently reduce training time and provide up to 4 x 4 speedup on 1024–4096 processes; the default 4 KB-page baseline does not scale over this range (Fig. 6 ). On friendster, the maximum benefit is 16% at 4096 processes. We also develop an MPI-3.0 Remote Memory Access (RMA) variant of Nomad using passive-target synchronization and the unified memory model . Unlike the default collective version, which couples communication and synchronization, RMA separates them through one-sided get and accumulate operations with flush calls for local/remote completion. Local context and vertex embeddings are exposed through MPI windows. After local positive and negative updates (Lines 11 and 16 , Algorithm 1 ), a sequence of asynchronous get operations fetches the remote context/vertex vectors. A local flush completes outstanding gets, enabling the corresponding remote updates (Lines 32 – 39 ) and direct accumulation of remote deltas via RMA accumulate. A subsequent flush ensures remote completion, replacing the MPI_Alltoallv on Line 30 . Fig. 10 shows the performance of RMA variants on youtube ( AR-Remote Refresh-Spill ) and friendster ( AR-Remote Aug-Pair ) at thousands of processes (chosen due to irregularities in the edge distributions ( σ E p _{E_{p}} > > 5000)). We also evaluate a get-accumulate variant (denoted − G ​ A -GA ) in place of get ( − G -G ) to exploit atomic execution; it improves accuracy by 2–5% on these inputs, but at additional performance cost. RMA increases load imbalance in constituent routines within the training loop, particularly the repeated sampling phase of Refresh-Spill ; in contrast, imbalance is less pronounced for Aug-Pair , where the one-time sampling phase occurs outside the training loop (see § IV-C ). Despite this, most RMA configurations improve performance by 10–20%. Table V quantifies this imbalance in MPI utilization: while communication dominates in both, the default variant exhibits at most 10% imbalance, whereas RMA exceeds 50%."
+    },
+    {
+      "heading": "VI Conclusion",
+      "body": "To the best of our knowledge, Nomad is the first work to study practical performance/quality trade-offs for MPI-based graph embedding on real-world graphs and provides flexible trade-offs among communication, synchronization, and sample quality across shared/distributed-memory platforms. Across 13 graphs ranging from millions to billions of edges, Nomad achieves substantial speedups over shared/distributed baselines ( 370 x 370 on small/medium graphs, 14 14 – 22 x 22 on billion-edge graphs, and 35 35 – 76 x 76 relative to PBG), with competitive Micro-F1/Macro-F1 relative to LINE, node2vec, and GraphVite. The performance/quality outcomes are driven by the choice of hyperparameters, configurations, and graphs."
+    },
+    {
+      "heading": "Acknowledgment",
+      "body": "This research is supported by the National Science Foundation (NSF) under Award 2243775 and the U.S. Department of Energy (DOE) through the Office of Advanced Scientific Computing Research’s “Orchestration for Distributed & Data-Intensive Scientific Exploration”, Biological and Environmental Research funded projects “Orchestrated Platform for Autonomous Laboratories” and “Foundational AI Models for Optimizing and Understanding Biological Systems” (OPAL FAMOUS) under LAB-25-3560 “Transformational AI Model Consortium”. Pacific Northwest National Laboratory is operated by Battelle for the DOE under Contract DE-AC05-76RL01830. This research used resources of the National Energy Research Scientific Computing Center (NERSC), a Department of Energy User Facility."
+    }
+  ],
+  "figures": [
+    {
+      "img_src": null,
+      "caption": "TABLE I : Comparison of NOMAD with existing graph sampling and embedding systems."
+    },
+    {
+      "img_src": "https://arxiv.org/html/2604.09419v1/x1.png",
+      "caption": "Figure 1 : With sync: processes observe up-to-date context. Without sync: delayed updates result in stale context, affecting quality."
+    },
+    {
+      "img_src": null,
+      "caption": "Algorithm 1 NOMAD: Distributed Node Embedding Inputs: G p = ( V p , E p ) G_{p}=(V_{p},E_{p}) portion of the (undirected) graph G G on Process p p , containing “local” and “ghost” vertices (not owned by process p p ) that have an edge with a vertex v ∈ V p v\\in V_{p} ; batch size B B ; #negatives per positive pair: K; λ \\lambda : weight decay; η \\eta : learning rate; α neg \\alpha_{\\text{neg}} : negative weight; Output: Embeddings 𝐔 \\mathbf{U} and 𝐂 \\mathbf{C}"
+    },
+    {
+      "img_src": null,
+      "caption": "Algorithm 2 Random Walks using MPI peer-to-peer interface. Input : G p = ( V p , E p ) G_{p}=(V_{p},E_{p}) partition of (undirected) graph G G in process p p , containing “local” and “ghost” vertices (not owned by process p p ) that have an edge with a vertex v ∈ V p v\\in V_{p} . S ​ I ​ Z ​ E SIZE is the outgoing/incoming buffer size, s ​ t ​ e ​ p ​ s steps is the walk length, {u, v} is the root edge to begin the walk and 𝒩 ​ ( x ) \\mathcal{N}(x) represents the (weighted) neighborhood of an arbitrary vertex x x . InOut : Edges in random walk over G G : 𝒫 \\mathcal{P} (local) and 𝒫 ′ \\mathcal{P^{\\prime}} (remote)."
+    },
+    {
+      "img_src": null,
+      "caption": "Algorithm 3 Invoking random walks for generating batches for sampling. Input : G p = ( V p , E p ) G_{p}=(V_{p},E_{p}) portion of the (undirected) graph G G on process p p . InOut : Edges in random walk over G G : 𝒫 \\mathcal{P} (local) and 𝒫 ′ \\mathcal{P^{\\prime}} (remote)."
+    },
+    {
+      "img_src": null,
+      "caption": "TABLE II: Best speedups observed across processes/variants."
+    },
+    {
+      "img_src": "https://arxiv.org/html/2604.09419v1/x2.png",
+      "caption": "Figure 2 : Comparison of Nomad with LINE and node2vec."
+    },
+    {
+      "img_src": "https://arxiv.org/html/2604.09419v1/x3.png",
+      "caption": "Figure 3 : Comparison of Nomad with PBG"
+    },
+    {
+      "img_src": null,
+      "caption": "TABLE III: Micro-F1 (Mi), Macro-F1 (Ma) on 10% test nodes."
+    },
+    {
+      "img_src": "https://arxiv.org/html/2604.09419v1/x4.png",
+      "caption": "Figure 4 : Embedding quality (Micro-F1, higher is better) on computers (left) and reddit (right) with increasing #processes."
+    },
+    {
+      "img_src": "https://arxiv.org/html/2604.09419v1/x5.png",
+      "caption": ""
+    },
+    {
+      "img_src": "https://arxiv.org/html/2604.09419v1/x6.png",
+      "caption": ""
+    },
+    {
+      "img_src": "https://arxiv.org/html/2604.09419v1/x7.png",
+      "caption": "Figure 5 : End-to-end time of Nomad variants on ogbn-arxiv"
+    },
+    {
+      "img_src": "https://arxiv.org/html/2604.09419v1/x8.png",
+      "caption": "Figure 6 : Scalability of Nomad on 13 diverse datasets (Table II ) up to 16K processes. Top: AllReduce; Bottom: Ibarrier."
+    },
+    {
+      "img_src": "https://arxiv.org/html/2604.09419v1/x10.png",
+      "caption": "Figure 7 : Distribution of positive samples across processes for AR-Local and AR-Remote (Reuse-Spill) on large datasets. Red markers denote IB-Local and IB-Remote (Reuse-Spill) , which show little or no variation across processes."
+    },
+    {
+      "img_src": null,
+      "caption": "TABLE IV : Communication analysis using CrayPAT on 2048 processes ( n n =32, ppn=64)"
+    },
+    {
+      "img_src": "https://arxiv.org/html/2604.09419v1/x11.png",
+      "caption": "Figure 8 : Breakdown of end-to-end execution time."
+    },
+    {
+      "img_src": "https://arxiv.org/html/2604.09419v1/x12.png",
+      "caption": "Figure 9 : 2 MB huge pages on IB-Remote (Aug-Pair) . Top: sampling/training breakdown. Bottom: end-to-end time."
+    },
+    {
+      "img_src": "https://arxiv.org/html/2604.09419v1/x13.png",
+      "caption": "Figure 10 : RMA variants increases load imbalance for Refresh-Spill (depicted by error bars): comparing regular against RMA for Refresh-Spill and Aug-Pair ."
+    },
+    {
+      "img_src": null,
+      "caption": "TABLE V : Top #3 MPI util. ( > > 90% of overall time) for default and RMA variants of Nomad for youtube (1024 processes)."
+    }
+  ],
+  "tables": [
+    {
+      "caption": "TABLE I : Comparison of NOMAD with existing graph sampling and embedding systems.",
+      "rows": [
+        [
+          "Framework",
+          "CPU",
+          "GPU",
+          "Distributed",
+          "Sampling",
+          "Training",
+          "Scale Up",
+          "Scale Out",
+          "Partitioned graph",
+          "Notes"
+        ],
+        [
+          "NOMAD (this work)",
+          "✓",
+          "✗",
+          "✓",
+          "✓",
+          "✓",
+          "✓",
+          "✓",
+          "✓",
+          "MPI collective communication and synchronization"
+        ],
+        [
+          "PyTorch-BigGraph",
+          "✓",
+          "✗",
+          "✓",
+          "✓",
+          "✓",
+          "✓",
+          "✓",
+          "✓",
+          "Parameter-server architecture with shared parameter synchronization"
+        ],
+        [
+          "Fast-Node2vec",
+          "✓",
+          "✗",
+          "✓",
+          "✓",
+          "✓",
+          "✓",
+          "✓",
+          "✓",
+          "Pregel-like iterative BSP"
+        ],
+        [
+          "GraphVite",
+          "✓",
+          "✓",
+          "✗",
+          "✓",
+          "✓",
+          "✓",
+          "✗",
+          "✗",
+          "Hybrid, OpenMP threads for sampling; GPU-based training"
+        ],
+        [
+          "Grape",
+          "✓",
+          "✗",
+          "✗",
+          "✓",
+          "✓",
+          "✓",
+          "✗",
+          "✗",
+          "Thread-level SIMD parallelism"
+        ],
+        [
+          "CuGraph",
+          "✗",
+          "✓",
+          "✓",
+          "✓",
+          "✗",
+          "✓",
+          "✓",
+          "✓",
+          "Dask-based multi-GPU random walk sampling (no training)"
+        ],
+        [
+          "NextDoor",
+          "✗",
+          "✓",
+          "✗",
+          "✓",
+          "✗",
+          "✓",
+          "✗",
+          "✗",
+          "Multi-GPU vertex-based sampling (no training)"
+        ],
+        [
+          "C-SAW",
+          "✗",
+          "✓",
+          "✗",
+          "✓",
+          "✗",
+          "✓",
+          "✗",
+          "✓",
+          "Multi-GPU sampling (partitions graph across GPUs, no training)"
+        ],
+        [
+          "gSampler",
+          "✗",
+          "✓",
+          "✗",
+          "✓",
+          "✗",
+          "✓",
+          "✗",
+          "✗",
+          "Multi-GPU sampling (no training)"
+        ]
+      ]
+    },
+    {
+      "caption": "TABLE II: Best speedups observed across processes/variants.",
+      "rows": [
+        [
+          "Datasets",
+          "| V | |V|",
+          "| E | |E|",
+          "min / max ⁡ ( σ E p ) /(_{E_{p}})",
+          "Speedup"
+        ],
+        [
+          "pubmed",
+          "20K",
+          "89K",
+          "12 / / 50 152",
+          "12 x"
+        ],
+        [
+          "photo",
+          "7.5K",
+          "238K",
+          "16 / / 50 1K",
+          "37 x"
+        ],
+        [
+          "computers",
+          "13K",
+          "491K",
+          "39 / / 50 3K",
+          "58 x"
+        ],
+        [
+          "physics",
+          "34K",
+          "495K",
+          "9 / / 50 181",
+          "23 x"
+        ],
+        [
+          "ogbn-arxiv",
+          "169K",
+          "2.3M",
+          "60 / / 50 2K",
+          "99 x"
+        ],
+        [
+          "youtube",
+          "1.1M",
+          "9.8M",
+          "199 / / 50 6K",
+          "370 x"
+        ],
+        [
+          "ogbn-proteins",
+          "132K",
+          "79M",
+          "2K / / 50 13K",
+          "266 x"
+        ],
+        [
+          "reddit",
+          "233K",
+          "114M",
+          "1K / / 50 35K",
+          "167 x"
+        ],
+        [
+          "ogbn-products",
+          "2.4M",
+          "123.7M",
+          "172 / / 50 21K",
+          "315 x"
+        ],
+        [
+          "hyperlink2012",
+          "39M",
+          "1.1B",
+          "104K / / 50 376K",
+          "22 x"
+        ],
+        [
+          "twitter7",
+          "41.6M",
+          "2.9B",
+          "35K / / 50 1.21M",
+          "14 x"
+        ],
+        [
+          "friendster",
+          "65.6M",
+          "3.6B",
+          "6K / / 50 396K",
+          "18 x"
+        ],
+        [
+          "ogbn-papers100M",
+          "111M",
+          "6.4B",
+          "14K / / 50 225K",
+          "19 x"
+        ]
+      ]
+    },
+    {
+      "caption": "TABLE III: Micro-F1 (Mi), Macro-F1 (Ma) on 10% test nodes.",
+      "rows": [
+        [
+          "Dataset",
+          "LINE",
+          "node2vec",
+          "GraphVite",
+          "Nomad (local)",
+          "Nomad (remote)"
+        ],
+        [
+          "Mi",
+          "Ma",
+          "Mi",
+          "Ma",
+          "Mi",
+          "Ma",
+          "Mi",
+          "Ma",
+          "Mi",
+          "Ma"
+        ],
+        [
+          "computers",
+          "0.61",
+          "0.50",
+          "0.50",
+          "0.41",
+          "0.79",
+          "0.74",
+          "0.83",
+          "0.82",
+          "0.83",
+          "0.83"
+        ],
+        [
+          "physics",
+          "0.59",
+          "0.31",
+          "0.74",
+          "0.69",
+          "0.60",
+          "0.41",
+          "0.78",
+          "0.69",
+          "0.83",
+          "0.77"
+        ],
+        [
+          "pubmed",
+          "0.41",
+          "0.30",
+          "0.48",
+          "0.43",
+          "0.40",
+          "0.22",
+          "0.62",
+          "0.53",
+          "0.53",
+          "0.40"
+        ],
+        [
+          "photo",
+          "0.77",
+          "0.73",
+          "0.51",
+          "0.48",
+          "0.77",
+          "0.70",
+          "0.84",
+          "0.82",
+          "0.89",
+          "0.88"
+        ],
+        [
+          "youtube",
+          "0.25",
+          "0.06",
+          "0.40",
+          "0.29",
+          "0.31",
+          "0.14",
+          "0.27",
+          "0.11",
+          "0.25",
+          "0.07"
+        ],
+        [
+          "ogbn-arxiv",
+          "0.31",
+          "0.04",
+          "0.45",
+          "0.22",
+          "0.44",
+          "0.10",
+          "0.54",
+          "0.21",
+          "0.26",
+          "0.05"
+        ],
+        [
+          "ogbn-products",
+          "0.28",
+          "0.02",
+          "0.55",
+          "0.23",
+          "0.59",
+          "0.24",
+          "0.72",
+          "0.31",
+          "0.71",
+          "0.31"
+        ],
+        [
+          "ogbn-proteins",
+          "0.62",
+          "0.48",
+          "OOM",
+          "OOM",
+          "0.62",
+          "0.46",
+          "0.66",
+          "0.54",
+          "0.66",
+          "0.54"
+        ],
+        [
+          "reddit",
+          "0.82",
+          "0.76",
+          "OOM",
+          "OOM",
+          "0.89",
+          "0.80",
+          "0.92",
+          "0.88",
+          "0.91",
+          "0.83"
+        ]
+      ]
+    },
+    {
+      "caption": "TABLE IV : Communication analysis using CrayPAT on 2048 processes ( n n =32, ppn=64)",
+      "rows": [
+        [
+          "arxiv ( | E | |E| =2.3M, σ E p _{E_{p}} =643)",
+          "youtube ( | E | |E| =9.8M, σ E p _{E_{p}} =11,127)"
+        ],
+        [
+          "Local (%MPI=99.4, Avg. Mem./PE=201 MiB)",
+          "Remote (%MPI=99.7, Avg. Mem./PE=208 MiB)",
+          "Local (%MPI=99.4, Avg. Mem./PE=247 MiB)",
+          "Remote (%MPI=98.8, Avg. Mem./PE=260 MiB)"
+        ],
+        [
+          "% Total",
+          "% Imbal.",
+          "Function",
+          "%Total",
+          "% Imbal.",
+          "Function",
+          "% Total",
+          "% Imbal.",
+          "Function",
+          "% Total",
+          "% Imbal.",
+          "Function"
+        ],
+        [
+          "46",
+          "9",
+          "MPI_Alltoallv",
+          "55",
+          "12",
+          "MPI_Allreduce",
+          "76",
+          "5",
+          "MPI_Alltoallv",
+          "80",
+          "1",
+          "MPI_Alltoallv"
+        ],
+        [
+          "35",
+          "45",
+          "MPI File I/O",
+          "15",
+          "11",
+          "MPI_Barrier",
+          "11",
+          "14",
+          "MPI_Alltoall",
+          "9",
+          "13",
+          "MPI_Allreduce"
+        ],
+        [
+          "12",
+          "35",
+          "MPI_Allreduce",
+          "13",
+          "5",
+          "MPI_Alltoallv",
+          "9",
+          "26",
+          "MPI_Allreduce",
+          "6",
+          "12",
+          "MPI_Alltoall"
+        ],
+        [
+          "7",
+          "38",
+          "MPI_Barrier",
+          "9",
+          "40",
+          "MPI File I/O",
+          "2",
+          "30",
+          "MPI_Barrier",
+          "1",
+          "33",
+          "MPI_Barrier"
+        ]
+      ]
+    },
+    {
+      "caption": "TABLE V : Top #3 MPI util. ( > > 90% of overall time) for default and RMA variants of Nomad for youtube (1024 processes).",
+      "rows": [
+        [
+          "youtube (default) MPI utilization",
+          "youtube (RMA) MPI utilization"
+        ],
+        [
+          "%-time",
+          "%-imb.",
+          "Function",
+          "%-time",
+          "%-imb.",
+          "Function"
+        ],
+        [
+          "74",
+          "1",
+          "MPI_Alltoallv",
+          "51",
+          "42",
+          "MPI_Allreduce"
+        ],
+        [
+          "15",
+          "10",
+          "MPI_Allreduce",
+          "27",
+          "51",
+          "MPI_Win_flush_all"
+        ],
+        [
+          "6",
+          "10",
+          "MPI_Alltoall",
+          "13",
+          "58",
+          "MPI_Win_flush_local_all"
+        ]
+      ]
+    }
+  ],
+  "math": [
+    "− G -G",
+    "K = 1 K{=}1",
+    "× \\times",
+    "j = 1 j=1",
+    "⊳ \\triangleright",
+    "Δ ← ∅ \\Delta\\leftarrow\\emptyset",
+    "U ← U + g ⋅ C − η ⋅ λ ⋅ U U\\leftarrow U+g\\cdot C-\\eta\\cdot\\lambda\\cdot U",
+    "C C",
+    "G p = ( V p , E p ) G_{p}=(V_{p},E_{p})",
+    "𝒫 \\mathcal{P}",
+    "𝒳 : 𝒳 ∼ d ​ i ​ s ​ c ​ r ​ e ​ t ​ e ​ ( 𝒩 ​ ( x ) ) ​ 𝚊𝚗𝚍 ​ n ​ x ​ t ​ _ ​ x ← 𝒳 ​ ( x ) \\mathcal{X}:\\mathcal{X}\\sim discrete(\\mathcal{N}(x))\\;\\mathtt{and}\\;nxt\\_x\\leftarrow\\mathcal{X}(x)",
+    "x , t ∈ 𝚎𝚗𝚞𝚖𝚎𝚛𝚊𝚝𝚎 ( t a r g e t s ) ∣ ! m s g _ s e n t [ x ] x,t\\in\\mathtt{enumerate}(targets)\\mid\\;!msg\\_sent[x]",
+    "𝙼𝙿𝙸 ​ _ ​ 𝙸𝚜𝚎𝚗𝚍 ​ ( s ​ b ​ u ​ f ​ [ t ​ i ​ d ​ x ] , S ​ I ​ Z ​ E , t ​ a ​ r ​ g ​ e ​ t , s ​ r ​ e ​ q ​ s ​ [ t ​ i ​ d ​ x ] ) \\mathtt{MPI\\_Isend}(sbuf[tidx],SIZE,target,sreqs[tidx])",
+    "S ​ I ​ Z ​ E = 128 SIZE=128",
+    "c ​ u ​ r ​ r ​ _ ​ s ​ t ​ e ​ p ​ s ← M ​ P ​ I ​ _ ​ A ​ l ​ l ​ r ​ e ​ d ​ u ​ c ​ e ​ ( ∑ v ​ i ​ s ​ i ​ t ​ e ​ d ) curr\\_steps\\leftarrow MPI\\_Allreduce(\\sum visited)",
+    "0.28 × 0.28\\times",
+    "U U",
+    "v − ∼ q ​ ( ⋅ ) v^{-}\\sim q(\\cdot)",
+    "s ​ t ​ e ​ p ​ s steps",
+    "𝚜𝚢𝚗𝚌 _ 𝚝𝚢𝚙𝚎 = = a l l r e d u c e \\mathtt{sync\\_type}==allreduce",
+    "p ​ a ​ i ​ r ​ s ← M ​ P ​ I ​ _ ​ A ​ l ​ l ​ r ​ e ​ d ​ u ​ c ​ e ​ ( | 𝒫 | , 𝚍𝚎𝚏𝚊𝚞𝚕𝚝 ​ _ ​ 𝚘𝚙 = 𝙼𝙰𝚇 ) pairs\\leftarrow MPI\\_Allreduce(|\\mathcal{P}|,\\mathtt{default\\_op}=\\mathtt{MAX})",
+    "v v",
+    "t ​ a ​ r ​ g ​ e ​ t , t ​ i ​ d ​ x ← o ​ w ​ n ​ e ​ r ​ ( n ​ x ​ t ​ _ ​ x ) , t ​ a ​ r ​ g ​ e ​ t ​ s ​ [ o ​ w ​ n ​ e ​ r ​ ( n ​ x ​ t ​ _ ​ x ) ] target,tidx\\leftarrow owner(nxt\\_x),targets[owner(nxt\\_x)]",
+    "𝑡𝑎𝑟𝑔𝑒𝑡 = = p \\mathit{target}==p",
+    "1.14 × 1.14\\times",
+    "0.40 × 0.40\\times",
+    "| E | |E|",
+    "s ​ b ​ u ​ f ​ [ t ​ i ​ d ​ x ] ← s ​ b ​ u ​ f ​ [ t ​ i ​ d ​ x ] ∪ { x , n ​ x ​ t ​ _ ​ x } sbuf[tidx]\\leftarrow sbuf[tidx]\\cup\\{x,nxt\\_x\\}",
+    "r ​ e ​ c ​ v ​ s ​ _ ​ d ​ o ​ n ​ e < | s ​ o ​ u ​ r ​ c ​ e ​ s | recvs\\_done<|sources|",
+    "4 × 4\\times",
+    "0.44 × 0.44\\times",
+    "{ u , v } ← 𝒳 ​ ( ) : 𝒳 ∼ d ​ i ​ s ​ c ​ r ​ e ​ t ​ e ​ ( { E p → / ‖ E p → ‖ } ) \\{u,v\\}\\leftarrow\\mathcal{X}():\\mathcal{X}\\sim discrete(\\{\\vec{E_{p}}/\\left\\lVert\\vec{E_{p}}\\right\\rVert\\})",
+    "35 35",
+    "LineUpdate ​ ( U ​ [ u ] , C ​ [ v − ] ) \\textsc{LineUpdate}(U[u],C[v^{-}])",
+    "δ ← g ⋅ 𝐔 0 − η ⋅ λ ⋅ Z \\delta\\leftarrow g\\cdot\\mathbf{U}_{0}-\\eta\\cdot\\lambda\\cdot Z",
+    "x x",
+    "p p",
+    "x : x ∈ c ​ q ​ 𝚊𝚗𝚍 ​ c ​ q ← c ​ q ∖ x x:x\\in cq\\;\\mathtt{and}\\;cq\\leftarrow cq\\setminus x",
+    "p ​ a ​ i ​ r ​ s ← 0 ∣ d ​ o ​ n ​ e ← f ​ a ​ l ​ s ​ e ∣ b ​ a ​ r ← f ​ a ​ l ​ s ​ e pairs\\leftarrow 0\\mid done\\leftarrow false\\mid bar\\leftarrow false",
+    "o ​ k ​ _ ​ s ​ e ​ n ​ d ​ [ x ] ← t ​ r ​ u ​ e ok\\_send[x]\\leftarrow true",
+    "2 2",
+    "V p ⊂ V V_{p}\\subset V",
+    "𝒫 2 → 𝒫 1 : B {}_{2}\\mathcal{P}\\rightarrow\\mathcal{P}_{1:B}",
+    "44 × 44\\times",
+    "1.47 × 1.47\\times",
+    "0.025 0.025",
+    "{ u , v } \\{u,v\\}",
+    "r r e q s [ 0 . . | s o u r c e s | ] ← ∅ , s r e q s [ 0 . . | t a r g e t s | ] ← ∅ rreqs[0..|sources|]\\leftarrow\\emptyset,sreqs[0..|targets|]\\leftarrow\\emptyset",
+    "𝚟𝚒𝚜𝚒𝚝𝚎𝚍 [ 𝚟 ] + = 1 ∣ c q ← c q ∪ v \\mathtt{visited[v]}\\mathrel{+}=1\\mid cq\\leftarrow cq\\cup v",
+    "s ​ b ​ u ​ f ​ [ 𝚘𝚠𝚗𝚎𝚛 ​ ( v ) ] ← s ​ b ​ u ​ f ​ [ 𝚘𝚠𝚗𝚎𝚛 ​ ( v ) ] ∪ { u , v } sbuf[\\mathtt{owner}(v)]\\leftarrow sbuf[\\mathtt{owner}(v)]\\cup\\{u,v\\}",
+    "𝒬 ← ∅ \\mathcal{Q}\\leftarrow\\emptyset",
+    "! d o n e !done",
+    "> >",
+    "g ← − η ​ α neg ​ σ ​ ( U ​ [ u ] , Z ​ [ v − ] ) g\\leftarrow-\\eta\\,\\alpha_{\\text{neg}}\\sigma(U[u],Z[v^{-}])",
+    "σ E p \\sigma_{E_{p}}",
+    "K K",
+    "( u , v − ) : G = ( V , E ) s . t . { u , v − } ∉ E ∣ u ∈ V a n d v − ∈ V (u,v^{-}):G=(V,E)\\;s.t.\\;\\{u,v^{-}\\}\\notin E\\mid u\\in V\\;and\\;v^{-}\\in V",
+    "δ \\delta",
+    "G G",
+    "25 25",
+    "𝐙 ← MPI_Alltoallv ​ ( 𝒬 ) \\mathbf{Z}\\leftarrow\\textsc{MPI\\_Alltoallv}(\\mathcal{Q})",
+    "𝒫 ← M ​ P ​ I ​ _ ​ A ​ l ​ l ​ t ​ o ​ a ​ l ​ l ​ v ​ ( 𝒫 ′ ) \\mathcal{P}\\leftarrow MPI\\_Alltoallv(\\mathcal{P^{\\prime}})",
+    "100 100",
+    "G p , 𝒫 , 𝒫 ′ , r ​ o ​ o ​ t = { u , v } G_{p},\\mathcal{P},\\mathcal{P^{\\prime}},root=\\{u,v\\}",
+    "𝐔 ​ [ u ] ← 𝐔 ​ [ u ] + g ⋅ 𝐂 ​ [ v ] − η ​ λ ​ 𝐔 ​ [ u ] \\displaystyle\\mathbf{U}[u]\\leftarrow\\mathbf{U}[u]+g\\cdot\\mathbf{C}[v]-\\eta\\lambda\\mathbf{U}[u]",
+    "( u , v − ) (u,v^{-})",
+    "S ​ I ​ Z ​ E SIZE",
+    "M ​ P ​ I ​ _ ​ I ​ b ​ a ​ r ​ r ​ i ​ e ​ r ​ ( n ​ b ​ _ ​ r ​ e ​ q ) MPI\\_Ibarrier(nb\\_req)",
+    "b ​ a ​ t ​ c ​ h ​ s ​ i ​ z ​ e × # ​ b ​ a ​ t ​ c ​ h ​ e ​ s × 2 \\sqrt{batch\\;size\\times\\#batches\\times 2}",
+    "5 × 5\\times",
+    "14 14",
+    "( ( log ⁡ p ⏟ synch + p × S ​ I ​ Z ​ E ⏟ point-to-point ) ⏟ until | 𝒫 | = 𝔹 for any/all p + p × | 𝒫 1 : 𝔹 | ⏟ all-to-all-v at training ) × # ​ 𝚋𝚊𝚝𝚌𝚑𝚎𝚜 \\displaystyle{\\small(\\underbrace{(\\underbrace{\\log p}_{\\text{synch}}+\\underbrace{p\\times SIZE}_{\\text{point-to-point}})}_{\\text{until $\\;|\\mathcal{P}|=\\mathbb{B}\\;$ for any/\\penalty 50all $\\;p$}}+\\underbrace{p\\times|\\mathcal{P}_{1:\\mathbb{B}}|}_{\\text{all-to-all-v at training}})\\times\\#\\mathtt{batches}}",
+    "v − ​ from ​ q ​ ( ⋅ ) v^{-}\\text{ from }q(\\cdot)",
+    "c ​ q ∉ ∅ cq\\notin\\emptyset",
+    "6 × 6\\times",
+    "76 × 76\\times",
+    "g ← η ​ ( 1 − σ ​ ( U ​ [ u ] , C ​ [ v ] ) ) g\\leftarrow\\eta\\,(1-\\sigma(U[u],C[v]))",
+    "v ∈ 𝒬 v\\in\\mathcal{Q}",
+    "r e c v s _ d o n e + = 1 recvs\\_done\\mathrel{+}=1",
+    "𝒬 ← 𝒬 ∪ { v } \\mathcal{Q}\\leftarrow\\mathcal{Q}\\cup\\{v\\}",
+    "p a i r s + = RandomWalk ( G p , 𝒫 , 𝒫 ′ , r o o t = { u , v } ) pairs\\mathrel{+}=\\textsc{RandomWalk}(G_{p},\\mathcal{P},\\mathcal{P^{\\prime}},root=\\{u,v\\})",
+    "s ​ e ​ n ​ d ​ s ​ _ ​ d ​ o ​ n ​ e ← 𝙼𝙿𝙸 ​ _ ​ 𝚃𝚎𝚜𝚝𝚜𝚘𝚖𝚎 ​ ( | t ​ a ​ r ​ g ​ e ​ t ​ s | , s ​ r ​ e ​ q ​ s ) sends\\_done\\leftarrow\\mathtt{MPI\\_Testsome}(|targets|,sreqs)",
+    "c ​ o ​ u ​ n ​ t ← M ​ P ​ I ​ _ ​ G ​ e ​ t ​ _ ​ c ​ o ​ u ​ n ​ t ​ ( s ) count\\leftarrow MPI\\_Get\\_count(s)",
+    "| 𝒫 | / 2 |\\mathcal{P}|/2",
+    "d ​ ( v ) d(v)",
+    "Δ ​ [ v − ] ← Δ ​ [ v − ] + δ \\Delta[v^{-}]\\leftarrow\\Delta[v^{-}]+\\delta",
+    "MPI_Alltoallv ​ ( Δ ) \\textsc{MPI\\_Alltoallv}(\\Delta)",
+    "C ​ [ v ] C[v]",
+    "𝚜𝚠𝚊𝚙 ​ ( c ​ q , n ​ q ) \\mathtt{swap}(cq,nq)",
+    "c o u n t = = 0 count==0",
+    "∀ { m , n } ∈ r ​ b ​ u ​ f ​ [ y ] : \\forall\\{m,n\\}\\in rbuf[y]:",
+    "v i s i t e d [ n ] + = 1 ∣ n q ← n q ∪ { m , n } ∣ 𝒫 ′ ← 𝒫 ′ ∪ { m , n } visited[n]\\mathrel{+}=1\\mid nq\\leftarrow nq\\cup\\{m,n\\}\\mid\\mathcal{P^{\\prime}}\\leftarrow\\mathcal{P^{\\prime}}\\cup\\{m,n\\}",
+    "y , s ∈ 𝚎𝚗𝚞𝚖𝚎𝚛𝚊𝚝𝚎 ​ ( s ​ o ​ u ​ r ​ c ​ e ​ s ) y,s\\in\\mathtt{enumerate}(sources)",
+    "34 34",
+    "E p E_{p}",
+    "c ​ u ​ r ​ r ​ _ ​ s ​ t ​ e ​ p ​ s ← 0 curr\\_steps\\leftarrow 0",
+    "Δ ​ [ v ] = ∑ ( g ⋅ 𝐔 ​ [ u ] − η ​ λ ​ 𝐂 ​ [ v ] ) \\displaystyle\\Delta[v]=\\sum\\left(g\\cdot\\mathbf{U}[u]-\\eta\\lambda\\mathbf{C}[v]\\right)",
+    "v − v^{-}",
+    "! r e c v s _ d o n e 𝚊𝚗𝚍 c u r r _ s t e p s < s t e p s !recvs\\_done\\;\\mathtt{and}\\;curr\\_steps<steps",
+    "q ​ ( v ) = d ​ ( v ) α ∑ x ∈ V d ​ ( x ) α , α = 0.75 \\displaystyle q(v)\\;=\\;\\frac{d(v)^{\\alpha}}{\\sum_{x\\in V}d(x)^{\\alpha}},\\qquad\\alpha=0.75",
+    "b b",
+    "𝔹 \\mathbb{B}",
+    "𝑖𝑓𝑓 \\mathit{iff}",
+    "167 × 167\\times",
+    "q ​ ( v ) ∝ d ​ ( v ) 0.75 q(v)\\propto d(v)^{0.75}",
+    "370 × 370\\times",
+    "g ← − η ​ α neg ​ σ ​ ( U ​ [ u ] , C ​ [ v − ] ) g\\leftarrow-\\eta\\,\\alpha_{\\text{neg}}\\sigma(U[u],C[v^{-}])",
+    "Δ ​ [ v ] ← Δ ​ [ v ] + δ \\Delta[v]\\leftarrow\\Delta[v]+\\delta",
+    "∀ c ∈ s ​ e ​ n ​ d ​ s ​ _ ​ d ​ o ​ n ​ e ⇒ s ​ b ​ u ​ f ​ [ c ] ← ∅ , o ​ k ​ _ ​ s ​ e ​ n ​ d ​ [ c ] ← f ​ a ​ l ​ s ​ e \\forall c\\in sends\\_done\\Rightarrow sbuf[c]\\leftarrow\\emptyset,\\;ok\\_send[c]\\leftarrow false",
+    "n ​ b ​ _ ​ r ​ e ​ q ← M ​ P ​ I ​ _ ​ R ​ E ​ Q ​ U ​ E ​ S ​ T ​ _ ​ N ​ U ​ L ​ L nb\\_req\\leftarrow MPI\\_REQUEST\\_NULL",
+    "v i s i t e d [ n x t _ x ] + = 1 ∣ n q ← n q ∪ n x t _ x ∣ 𝒫 ← 𝒫 ∪ { x , n x t _ x } visited[nxt\\_x]\\mathrel{+}=1\\mid nq\\leftarrow nq\\cup nxt\\_x\\mid\\mathcal{P}\\leftarrow\\mathcal{P}\\cup\\{x,nxt\\_x\\}",
+    "owner ​ ( u ) = owner ​ ( v ) = p \\mathrm{owner}(u)=\\mathrm{owner}(v)=p",
+    "58 × 58\\times",
+    "u u",
+    "𝐂 ​ [ v ] ← 𝐂 ​ [ v ] + g ⋅ 𝐔 ​ [ u ] − η ​ λ ​ 𝐂 ​ [ v ] , \\displaystyle\\mathbf{C}[v]\\leftarrow\\mathbf{C}[v]+g\\cdot\\mathbf{U}[u]-\\eta\\lambda\\mathbf{C}[v],",
+    "s ​ a ​ m ​ p ​ l ​ e ​ s ≥ B samples\\geq B",
+    "η \\eta",
+    "v ∈ V p v\\in V_{p}",
+    "0.90 × 0.90\\times",
+    "𝚟𝚒𝚜𝚒𝚝𝚎𝚍 [ 𝚞 ] + = 1 ∣ 𝒫 ← 𝒫 ∪ { u , v } \\mathtt{visited[u]}\\mathrel{+}=1\\mid\\mathcal{P}\\leftarrow\\mathcal{P}\\cup\\{u,v\\}",
+    "ℓ 2 \\ell_{2}",
+    "𝙼𝙿𝙸 ​ _ ​ 𝙸𝚛𝚎𝚌𝚟 ​ ( r ​ b ​ u ​ f ​ [ y ] , S ​ I ​ Z ​ E , s , r ​ r ​ e ​ q ​ s ​ [ y ] ) \\mathtt{MPI\\_Irecv}(rbuf[y],SIZE,s,rreqs[y])",
+    "0.60 × 0.60\\times",
+    "d ​ o ​ n ​ e ← t ​ r ​ u ​ e done\\leftarrow true",
+    "1.05 × 1.05\\times",
+    "Δ \\Delta",
+    "Δ ​ [ v ] \\Delta[v]",
+    "δ ← LineUpdate ​ ( U ​ [ u ] , Z ​ [ v − ] , g ) \\delta\\leftarrow\\textsc{LineUpdate}(U[u],Z[v^{-}],g)",
+    "30 × 30\\times",
+    "18 × 18\\times",
+    "g ← η ​ ( 1 − σ ​ ( U ​ [ u ] , Z ​ [ v ] ) ) g\\leftarrow\\eta\\,(1-\\sigma(U[u],Z[v]))",
+    "C ← C + g ⋅ 𝐔 0 − η ⋅ λ ⋅ C C\\leftarrow C+g\\cdot\\mathbf{U}_{0}-\\eta\\cdot\\lambda\\cdot C",
+    "22 × 22\\times",
+    "G p , B , 𝚜𝚢𝚗𝚌 ​ _ ​ 𝚝𝚢𝚙𝚎 = a ​ l ​ l ​ r ​ e ​ d ​ u ​ c ​ e G_{p},B,\\mathtt{sync\\_type}=allreduce",
+    "U , C , g U,C,g",
+    "| E | = |E|=",
+    "𝐔 \\mathbf{U}",
+    "12 × 12\\times",
+    "r ​ e ​ c ​ v ​ s ​ _ ​ d ​ o ​ n ​ e ← M ​ P ​ I ​ _ ​ A ​ l ​ l ​ r ​ e ​ d ​ u ​ c ​ e ​ ( r ​ e ​ c ​ v ​ s ​ _ ​ d ​ o ​ n ​ e ) recvs\\_done\\leftarrow MPI\\_Allreduce(recvs\\_done)",
+    "− G ​ A -GA",
+    "c ​ u ​ r ​ r ​ _ ​ s ​ t ​ e ​ p ​ s ≥ s ​ t ​ e ​ p ​ s curr\\_steps\\geq steps",
+    "α neg \\alpha_{\\text{neg}}",
+    "𝒩 ​ ( x ) \\mathcal{N}(x)",
+    "𝐂 ​ [ v ] \\mathbf{C}[v]",
+    "p ​ a ​ i ​ r ​ s ≥ B pairs\\geq B",
+    "𝐔 ​ [ u ] \\mathbf{U}[u]",
+    "𝚘𝚠𝚗𝚎𝚛 ( v ) = = p \\mathtt{owner}(v)==p",
+    "n n",
+    "g g",
+    "{ r b u f [ 0 . . | s o u r c e s | × S I Z E ] , s b u f [ 0 . . | t a r g e t s | × S I Z E ] } ← ∅ \\{rbuf[0..|sources|\\times SIZE],sbuf[0..|targets|\\times SIZE]\\}\\leftarrow\\emptyset",
+    "∀ x , t ∈ 𝚎𝚗𝚞𝚖𝚎𝚛𝚊𝚝𝚎 ​ ( t ​ a ​ r ​ g ​ e ​ t ​ s ) ⇒ o ​ k ​ _ ​ s ​ e ​ n ​ d ​ [ x ] = f ​ a ​ l ​ s ​ e \\forall x,t\\in\\mathtt{enumerate}(targets)\\Rightarrow ok\\_send[x]=false",
+    "n ​ q ≠ ∅ ​ 𝚊𝚗𝚍 ​ c ​ u ​ r ​ r ​ _ ​ s ​ t ​ e ​ p ​ s < s ​ t ​ e ​ p ​ s nq\\neq\\emptyset\\;\\mathtt{and}\\;curr\\_steps<steps",
+    "( u , v ) : G = ( V , E ) s . t . { u , v } ∈ E ∣ u ∈ V a n d v ∈ V (u,v):G=(V,E)\\;s.t.\\;\\{u,v\\}\\in E\\mid u\\in V\\;and\\;v\\in V",
+    "owner ​ ( v − ) = p \\mathrm{owner}(v^{-})=p",
+    "4 4",
+    "s ​ o ​ u ​ r ​ c ​ e ​ s , t ​ a ​ r ​ g ​ e ​ t ​ s ← sources,targets\\leftarrow",
+    "0.38 0.38",
+    "M ​ P ​ I ​ _ ​ T ​ e ​ s ​ t ​ ( n ​ b ​ _ ​ r ​ e ​ q ) MPI\\_Test(nb\\_req)",
+    "𝒬 ← 𝒬 ∪ { v − } \\mathcal{Q}\\leftarrow\\mathcal{Q}\\cup\\{v^{-}\\}",
+    "0.39 × 0.39\\times",
+    "𝙼𝙿𝙸 ​ _ ​ 𝙸𝚜𝚎𝚗𝚍 ​ ( N ​ U ​ L ​ L , 0 , t , s ​ r ​ e ​ q ​ s ​ [ t ] ) \\mathtt{MPI\\_Isend}(NULL,0,t,sreqs[t])",
+    "( u , v ) ∈ 𝒫 (u,v)\\in\\mathcal{P}",
+    "owner ​ ( v ) = p \\mathrm{owner}(v)=p",
+    "o ​ k ​ _ ​ s ​ e ​ n ​ d ​ [ t ​ i ​ d ​ x ] ← t ​ r ​ u ​ e ok\\_send[tidx]\\leftarrow true",
+    "1.12 × 1.12\\times",
+    "𝙼𝙿𝙸 ​ _ ​ 𝚃𝚎𝚜𝚝 ​ ( r ​ r ​ e ​ q ​ s ​ [ y ] ) \\mathtt{MPI\\_Test}(rreqs[y])",
+    "𝚜𝚒𝚣𝚎 ( s b u f [ t i d x ] ) = = S I Z E a n d ! 𝑜𝑘 _ 𝑠𝑒𝑛𝑑 [ t i d x ] \\mathtt{size}(sbuf[tidx])==SIZE\\;and\\;!\\mathit{ok\\_send}[tidx]",
+    "| V | / p |V|/p",
+    "owner ​ ( u ) = p \\mathrm{owner}(u)=p",
+    "18 18",
+    "LineUpdate ​ ( U ​ [ u ] , C ​ [ v ] , g ) \\textsc{LineUpdate}(U[u],C[v],g)",
+    "𝔹 ⋅ b ​ a ​ t ​ c ​ h ​ s ​ i ​ z ​ e ⋅ 2 \\sqrt{\\mathbb{B}\\cdot batch\\;size\\cdot 2}",
+    "d d",
+    "2 × 2\\times",
+    "/ /\\penalty 50",
+    "51 × 51\\times",
+    "8 × 8\\times",
+    "v − ∈ 𝒬 v^{-}\\in\\mathcal{Q}",
+    "G = ( V , E ) G=(V,E)",
+    "δ ← LineUpdate ​ ( U ​ [ u ] , Z ​ [ v ] , g ) \\delta\\leftarrow\\textsc{LineUpdate}(U[u],Z[v],g)",
+    "λ \\lambda",
+    "b ​ a ​ r ← t ​ r ​ u ​ e bar\\leftarrow true",
+    "𝒫 ′ \\mathcal{P^{\\prime}}",
+    "𝐂 \\mathbf{C}",
+    "min / max ⁡ ( σ E p ) \\min/\\max(\\sigma_{E_{p}})",
+    "𝐔 0 ← U \\mathbf{U}_{0}\\leftarrow U",
+    "∀ v ∈ V p : v ​ i ​ s ​ i ​ t ​ e ​ d ​ [ v ] ← 0 \\forall v\\in V_{p}:visited[v]\\leftarrow 0",
+    "| V | |V|",
+    "( u , v ) (u,v)",
+    "B B",
+    "c ​ q , n ​ q ← ∅ cq,nq\\leftarrow\\emptyset",
+    "𝒫 ← GeneratePairs ​ ( G p , B ) \\mathcal{P}\\leftarrow\\textsc{GeneratePairs}(G_{p},B)"
+  ]
+}

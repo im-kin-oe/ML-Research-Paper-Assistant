@@ -1,8 +1,6 @@
 .env
 papers/
-cleaned_json/
 papers_html/
 paper.json
-summaries/
 __pycache__/
 *.pyc
